@@ -12,7 +12,12 @@ from pypdf import PdfReader
 
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter
+from telegram.error import (
+    Conflict,
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -29,8 +34,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
 MAX_FILE_SIZE = MAX_FILE_MB * 1024 * 1024
-
-MAX_PAGES = 40
+MAX_PAGES = 50
 
 # ============================================================
 # LOGGING
@@ -45,15 +49,65 @@ logger = logging.getLogger("LEX")
 
 
 # ============================================================
-# HASH
+# KNOWN PDF EDITORS / REWRITERS
 # ============================================================
 
-def sha256(path: Path):
+EDITORS = {
+    "sejda": "Sejda",
+    "smallpdf": "Smallpdf",
+    "ilovepdf": "iLovePDF",
+    "ilovePDF": "iLovePDF",
+    "pdfescape": "PDFescape",
+    "nitro": "Nitro PDF",
+    "foxit": "Foxit PDF",
+    "adobe acrobat": "Adobe Acrobat",
+    "acrobat": "Adobe Acrobat",
+    "photoshop": "Adobe Photoshop",
+    "illustrator": "Adobe Illustrator",
+    "indesign": "Adobe InDesign",
+    "gimp": "GIMP",
+    "canva": "Canva",
+    "pdfsam": "PDFsam",
+    "libreoffice": "LibreOffice",
+    "wkhtmltopdf": "wkhtmltopdf",
+    "weasyprint": "WeasyPrint",
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+def find_editors(text):
+
+    found = []
+
+    lower = text.lower()
+
+    for key, name in EDITORS.items():
+
+        if key.lower() in lower:
+            if name not in found:
+                found.append(name)
+
+    return found
+
+
+def sha256(path):
 
     h = hashlib.sha256()
 
     with open(path, "rb") as f:
+
         while True:
+
             chunk = f.read(1024 * 1024)
 
             if not chunk:
@@ -65,140 +119,233 @@ def sha256(path: Path):
 
 
 # ============================================================
-# PDF BASIC CHECK
+# RAW PDF FORENSICS
 # ============================================================
 
-def check_pdf(path: Path):
+def raw_forensics(path):
+
+    raw = path.read_bytes()
 
     result = {
-        "valid": False,
-        "pages": 0,
-        "metadata": {},
-        "fonts": set(),
-        "images": 0,
-        "annotations": 0,
-        "forms": 0,
+        "size": len(raw),
+        "eof": 0,
+        "xref": 0,
+        "startxref": 0,
+        "objects": 0,
+        "streams": 0,
         "javascript": False,
         "embedded": False,
-        "incremental": False,
-        "signature": False,
-        "text_pages": 0,
-        "scan_pages": 0,
+        "signatures": False,
+        "editors": [],
         "warnings": [],
         "score": 0,
     }
 
-    doc = None
+    # --------------------------------------------------------
+    # EOF / revisions
+    # --------------------------------------------------------
+
+    result["eof"] = len(
+        re.findall(
+            rb"%%EOF",
+            raw,
+        )
+    )
+
+    result["startxref"] = len(
+        re.findall(
+            rb"startxref",
+            raw,
+        )
+    )
+
+    result["xref"] = len(
+        re.findall(
+            rb"(?:^|\n)xref(?:\s|\n)",
+            raw,
+            re.MULTILINE,
+        )
+    )
 
     # --------------------------------------------------------
-    # PyMuPDF
+    # Objects
+    # --------------------------------------------------------
+
+    result["objects"] = len(
+        re.findall(
+            rb"\n\d+\s+\d+\s+obj\b",
+            raw,
+        )
+    )
+
+    result["streams"] = len(
+        re.findall(
+            rb"\bstream\b",
+            raw,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Dangerous / special objects
+    # --------------------------------------------------------
+
+    if (
+        b"/JavaScript" in raw
+        or b"/JavaScript " in raw
+        or b"/JS " in raw
+        or b"/JS/" in raw
+    ):
+
+        result["javascript"] = True
+
+        result["warnings"].append(
+            "JavaScript موجود داخل الملف."
+        )
+
+        result["score"] += 15
+
+    if (
+        b"/EmbeddedFile" in raw
+        or b"/Filespec" in raw
+    ):
+
+        result["embedded"] = True
+
+        result["warnings"].append(
+            "ملف يحتوي على embedded objects/files."
+        )
+
+        result["score"] += 3
+
+    if (
+        b"/ByteRange" in raw
+        or b"/adbe.pkcs7" in raw
+        or b"/Adobe.PPKLite" in raw
+    ):
+
+        result["signatures"] = True
+
+    # --------------------------------------------------------
+    # Editor fingerprints
+    # --------------------------------------------------------
+
+    try:
+        raw_text = raw.decode(
+            "latin-1",
+            errors="ignore",
+        )
+    except Exception:
+        raw_text = ""
+
+    result["editors"] = find_editors(
+        raw_text
+    )
+
+    if result["editors"]:
+
+        for editor in result["editors"]:
+
+            result["warnings"].append(
+                f"أثر برنامج PDF: {editor}"
+            )
+
+        # Strong indicator of processing,
+        # NOT automatic proof of fraud.
+        result["score"] += 35
+
+    # --------------------------------------------------------
+    # Incremental updates
+    # --------------------------------------------------------
+
+    if result["eof"] > 1:
+
+        result["warnings"].append(
+            f"عدة PDF revisions محتملة: "
+            f"{result['eof']} %%EOF"
+        )
+
+        result["score"] += min(
+            20,
+            (result["eof"] - 1) * 5,
+        )
+
+    if result["startxref"] > 1:
+
+        result["warnings"].append(
+            f"عدة startxref: "
+            f"{result['startxref']}"
+        )
+
+        result["score"] += 5
+
+    result["score"] = min(
+        100,
+        result["score"],
+    )
+
+    return result
+
+
+# ============================================================
+# PDF INFO + XMP
+# ============================================================
+
+def metadata_forensics(path):
+
+    result = {
+        "info": {},
+        "xmp": "",
+        "editors": [],
+        "warnings": [],
+        "score": 0,
+    }
+
+    # --------------------------------------------------------
+    # pypdf Info
+    # --------------------------------------------------------
+
+    try:
+
+        reader = PdfReader(
+            str(path),
+            strict=False,
+        )
+
+        metadata = reader.metadata
+
+        if metadata:
+
+            for key, value in metadata.items():
+
+                key = clean(key)
+                value = clean(value)
+
+                if key and value:
+
+                    result["info"][key] = value
+
+    except Exception as e:
+
+        logger.warning(
+            "Metadata reader failed: %s",
+            e,
+        )
+
+    # --------------------------------------------------------
+    # PyMuPDF XMP
     # --------------------------------------------------------
 
     try:
 
         doc = fitz.open(str(path))
 
-        result["valid"] = True
-        result["pages"] = doc.page_count
-
         try:
-            result["metadata"] = doc.metadata or {}
-        except Exception:
-            pass
 
-        pages = min(
-            doc.page_count,
-            MAX_PAGES,
-        )
+            xmp = doc.get_xml_metadata()
 
-        for i in range(pages):
+            if xmp:
 
-            try:
-
-                page = doc[i]
-
-                text = (
-                    page.get_text("text")
-                    or ""
-                ).strip()
-
-                if len(text) >= 10:
-                    result["text_pages"] += 1
-
-                images = []
-
-                try:
-                    images = page.get_images(
-                        full=True
-                    )
-
-                    result["images"] += len(
-                        images
-                    )
-
-                except Exception:
-                    pass
-
-                if len(text) < 10 and images:
-                    result["scan_pages"] += 1
-
-                try:
-
-                    fonts = page.get_fonts(
-                        full=True
-                    )
-
-                    for font in fonts:
-
-                        if len(font) > 3:
-
-                            name = str(
-                                font[3] or ""
-                            ).strip()
-
-                            if name:
-                                result[
-                                    "fonts"
-                                ].add(name)
-
-                except Exception:
-                    pass
-
-                try:
-
-                    annots = page.annots()
-
-                    if annots:
-                        for _ in annots:
-                            result[
-                                "annotations"
-                            ] += 1
-
-                except Exception:
-                    pass
-
-            except Exception as e:
-
-                logger.warning(
-                    "Page %s failed: %s",
-                    i + 1,
-                    e,
-                )
-
-        try:
-            if doc.embfile_names():
-                result["embedded"] = True
-        except Exception:
-            pass
-
-        try:
-            xml = doc.get_xml_metadata()
-
-            if xml and (
-                "javascript" in xml.lower()
-                or "/js" in xml.lower()
-            ):
-                result["javascript"] = True
+                result["xmp"] = xmp
 
         except Exception:
             pass
@@ -208,7 +355,316 @@ def check_pdf(path: Path):
     except Exception as e:
 
         logger.warning(
-            "PyMuPDF failed: %s",
+            "XMP extraction failed: %s",
+            e,
+        )
+
+    # --------------------------------------------------------
+    # Combined metadata
+    # --------------------------------------------------------
+
+    info_text = "\n".join(
+        f"{k}: {v}"
+        for k, v in result["info"].items()
+    )
+
+    combined = (
+        info_text
+        + "\n"
+        + result["xmp"]
+    )
+
+    result["editors"] = find_editors(
+        combined
+    )
+
+    if result["editors"]:
+
+        for editor in result["editors"]:
+
+            result["warnings"].append(
+                f"Metadata/XMP يشير إلى: {editor}"
+            )
+
+        result["score"] += 40
+
+    # --------------------------------------------------------
+    # Creation / Modification
+    # --------------------------------------------------------
+
+    creation_keys = [
+        "/CreationDate",
+        "CreationDate",
+        "creationDate",
+    ]
+
+    modification_keys = [
+        "/ModDate",
+        "ModDate",
+        "modDate",
+    ]
+
+    creation = ""
+
+    modified = ""
+
+    for key in creation_keys:
+
+        if key in result["info"]:
+
+            creation = result[
+                "info"
+            ][key]
+
+            break
+
+    for key in modification_keys:
+
+        if key in result["info"]:
+
+            modified = result[
+                "info"
+            ][key]
+
+            break
+
+    if creation and modified:
+
+        if creation != modified:
+
+            result["warnings"].append(
+                "CreationDate و ModDate مختلفان."
+            )
+
+            result["score"] += 10
+
+    # --------------------------------------------------------
+    # XMP fields
+    # --------------------------------------------------------
+
+    xmp = result["xmp"]
+
+    xmp_creator = re.findall(
+        r"<(?:[^:>]+:)?CreatorTool[^>]*>"
+        r"(.*?)"
+        r"</(?:[^:>]+:)?CreatorTool>",
+        xmp,
+        re.I | re.S,
+    )
+
+    xmp_producer = re.findall(
+        r"<(?:[^:>]+:)?Producer[^>]*>"
+        r"(.*?)"
+        r"</(?:[^:>]+:)?Producer>",
+        xmp,
+        re.I | re.S,
+    )
+
+    if xmp_creator:
+
+        creator_text = " ".join(
+            xmp_creator
+        )
+
+        editors = find_editors(
+            creator_text
+        )
+
+        if editors:
+
+            result["warnings"].append(
+                "XMP CreatorTool: "
+                + ", ".join(editors)
+            )
+
+            result["score"] += 20
+
+    if xmp_producer:
+
+        producer_text = " ".join(
+            xmp_producer
+        )
+
+        editors = find_editors(
+            producer_text
+        )
+
+        if editors:
+
+            result["warnings"].append(
+                "XMP Producer: "
+                + ", ".join(editors)
+            )
+
+            result["score"] += 20
+
+    result["score"] = min(
+        100,
+        result["score"],
+    )
+
+    return result
+
+
+# ============================================================
+# DOCUMENT STRUCTURE
+# ============================================================
+
+def document_forensics(path):
+
+    result = {
+        "pages": 0,
+        "text_pages": 0,
+        "scan_pages": 0,
+        "fonts": set(),
+        "images": 0,
+        "annotations": 0,
+        "forms": False,
+        "page_details": [],
+        "warnings": [],
+        "score": 0,
+    }
+
+    doc = None
+
+    try:
+
+        doc = fitz.open(str(path))
+
+        result["pages"] = doc.page_count
+
+        pages = min(
+            doc.page_count,
+            MAX_PAGES,
+        )
+
+        for index in range(pages):
+
+            page = doc[index]
+
+            text = (
+                page.get_text("text")
+                or ""
+            ).strip()
+
+            if len(text) >= 10:
+
+                result[
+                    "text_pages"
+                ] += 1
+
+            images = []
+
+            try:
+
+                images = page.get_images(
+                    full=True
+                )
+
+                result["images"] += len(
+                    images
+                )
+
+            except Exception:
+                pass
+
+            if (
+                len(text) < 10
+                and images
+            ):
+
+                result[
+                    "scan_pages"
+                ] += 1
+
+            fonts = set()
+
+            try:
+
+                for font in page.get_fonts(
+                    full=True
+                ):
+
+                    if len(font) > 3:
+
+                        name = clean(
+                            font[3]
+                        )
+
+                        if name:
+                            fonts.add(name)
+                            result[
+                                "fonts"
+                            ].add(name)
+
+            except Exception:
+                pass
+
+            annot_count = 0
+
+            try:
+
+                annots = page.annots()
+
+                if annots:
+
+                    for _ in annots:
+                        annot_count += 1
+                        result[
+                            "annotations"
+                        ] += 1
+
+            except Exception:
+                pass
+
+            result[
+                "page_details"
+            ].append({
+                "page": index + 1,
+                "text_length": len(text),
+                "images": len(images),
+                "fonts": sorted(fonts),
+                "annotations": annot_count,
+            })
+
+        # Forms
+        try:
+
+            widgets = []
+
+            for page in doc:
+
+                try:
+
+                    for widget in (
+                        page.widgets()
+                        or []
+                    ):
+
+                        widgets.append(widget)
+
+                except Exception:
+                    pass
+
+            if widgets:
+
+                result["forms"] = True
+
+                result["warnings"].append(
+                    "AcroForm fields موجودة."
+                )
+
+                result["score"] += 3
+
+        except Exception:
+            pass
+
+        doc.close()
+
+    except Exception as e:
+
+        logger.warning(
+            "Document analysis failed: %s",
             e,
         )
 
@@ -220,311 +676,35 @@ def check_pdf(path: Path):
                 pass
 
     # --------------------------------------------------------
-    # pypdf secondary parser
+    # Font consistency
     # --------------------------------------------------------
 
-    try:
-
-        reader = PdfReader(
-            str(path),
-            strict=False,
-        )
-
-        if not result["valid"]:
-            result["valid"] = True
-
-        if result["pages"] == 0:
-            result["pages"] = len(
-                reader.pages
-            )
-
-        try:
-
-            if reader.is_encrypted:
-                result["warnings"].append(
-                    "الملف مشفّر."
-                )
-
-        except Exception:
-            pass
-
-        try:
-
-            if reader.metadata:
-
-                for key, value in (
-                    reader.metadata.items()
-                ):
-
-                    if key not in result[
-                        "metadata"
-                    ]:
-
-                        result["metadata"][
-                            key
-                        ] = str(value)
-
-        except Exception:
-            pass
-
-    except Exception as e:
-
-        logger.warning(
-            "pypdf failed: %s",
-            e,
-        )
-
-    # --------------------------------------------------------
-    # RAW PDF FORENSICS
-    # --------------------------------------------------------
-
-    try:
-
-        raw = path.read_bytes()
-
-        eof_count = len(
-            re.findall(
-                rb"%%EOF",
-                raw,
-            )
-        )
-
-        xref_count = len(
-            re.findall(
-                rb"startxref",
-                raw,
-            )
-        )
-
-        # Multiple EOF / xref can indicate
-        # incremental saves, but NOT necessarily fraud.
-        if eof_count > 1:
-
-            result["incremental"] = True
-
-            result["warnings"].append(
-                f"عدة %%EOF موجودة ({eof_count})."
-            )
-
-            result["score"] += min(
-                15,
-                eof_count * 3,
-            )
-
-        if xref_count > 1:
-
-            result["incremental"] = True
-
-            result["warnings"].append(
-                f"عدة startxref موجودة ({xref_count})."
-            )
-
-            result["score"] += 5
-
-        # JavaScript
-        if (
-            b"/JavaScript" in raw
-            or b"/JS " in raw
-            or b"/JS/" in raw
-        ):
-
-            result["javascript"] = True
-
-            result["warnings"].append(
-                "JavaScript موجود داخل PDF."
-            )
-
-            result["score"] += 15
-
-        # Forms
-        if b"/AcroForm" in raw:
-
-            result["forms"] = 1
-
-            result["warnings"].append(
-                "AcroForm موجود."
-            )
-
-            result["score"] += 3
-
-        # Signature
-        if (
-            b"/Sig" in raw
-            or b"/adbe.pkcs7" in raw
-            or b"/Adobe.PPKLite" in raw
-        ):
-
-            result["signature"] = True
-
-        # Embedded objects
-        if (
-            b"/EmbeddedFile" in raw
-            or b"/Filespec" in raw
-        ):
-
-            result["embedded"] = True
-
-            result["score"] += 3
-
-    except Exception as e:
-
-        logger.warning(
-            "Raw forensic analysis failed: %s",
-            e,
-        )
-
-    # --------------------------------------------------------
-    # METADATA
-    # --------------------------------------------------------
-
-    metadata = " ".join(
-        str(v).lower()
-        for v in result["metadata"].values()
-    )
-
-    suspicious_editors = [
-        "photoshop",
-        "gimp",
-        "illustrator",
-        "indesign",
-        "canva",
-        "nitro",
-        "foxit",
-    ]
-
-    found = []
-
-    for editor in suspicious_editors:
-
-        if editor in metadata:
-            found.append(editor)
-
-    if found:
+    if len(result["fonts"]) > 12:
 
         result["warnings"].append(
-            "برنامج تحرير ظاهر في metadata: "
-            + ", ".join(
-                sorted(set(found))
-            )
-        )
-
-        result["score"] += 8
-
-    # --------------------------------------------------------
-    # CREATION / MODIFICATION
-    # --------------------------------------------------------
-
-    creation = (
-        result["metadata"].get(
-            "creationDate"
-        )
-        or result["metadata"].get(
-            "CreationDate"
-        )
-        or result["metadata"].get(
-            "/CreationDate"
-        )
-    )
-
-    modified = (
-        result["metadata"].get(
-            "modDate"
-        )
-        or result["metadata"].get(
-            "ModDate"
-        )
-        or result["metadata"].get(
-            "/ModDate"
-        )
-    )
-
-    if creation and modified:
-
-        if str(creation) != str(modified):
-
-            result["warnings"].append(
-                "تاريخ الإنشاء والتعديل مختلف."
-            )
-
-            result["score"] += 5
-
-    # --------------------------------------------------------
-    # FONT ANALYSIS
-    # --------------------------------------------------------
-
-    font_count = len(
-        result["fonts"]
-    )
-
-    if font_count >= 10:
-
-        result["warnings"].append(
-            f"عدد الخطوط مرتفع: {font_count}"
+            f"عدد الخطوط مرتفع: "
+            f"{len(result['fonts'])}"
         )
 
         result["score"] += 5
 
-    # --------------------------------------------------------
-    # SCANNED DOCUMENT
-    # --------------------------------------------------------
-
-    if (
-        result["pages"] > 0
-        and result["scan_pages"] > 0
-        and result["text_pages"] == 0
-    ):
-
-        result["warnings"].append(
-            "الوثيقة تبدو Scan/صور."
-        )
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    result["score"] = max(
-        0,
-        min(
-            100,
-            result["score"],
-        ),
-    )
-
-    if result["score"] >= 50:
-
-        result["status"] = (
-            "🔴 اشتباه قوي"
-        )
-
-    elif result["score"] >= 25:
-
-        result["status"] = (
-            "🟠 مؤشرات تحتاج فحص"
-        )
-
-    else:
-
-        result["status"] = (
-            "🟢 لا توجد مؤشرات قوية"
-        )
-
-    result["fonts"] = sorted(
-        result["fonts"]
+    result["score"] = min(
+        100,
+        result["score"],
     )
 
     return result
 
 
 # ============================================================
-# VISUAL ANALYSIS
+# VISUAL PAGE FINGERPRINT
 # ============================================================
 
-def visual_analysis(path: Path):
+def visual_forensics(path):
 
     result = {
-        "pages": 0,
         "rendered": 0,
-        "page_hashes": [],
+        "hashes": [],
         "error": None,
     }
 
@@ -539,41 +719,29 @@ def visual_analysis(path: Path):
             MAX_PAGES,
         )
 
-        result["pages"] = pages
+        for index in range(pages):
 
-        for i in range(pages):
+            page = doc[index]
 
-            try:
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(
+                    1.2,
+                    1.2,
+                ),
+                alpha=False,
+            )
 
-                page = doc[i]
+            digest = hashlib.sha256(
+                pix.samples
+            ).hexdigest()
 
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(
-                        1.5,
-                        1.5,
-                    ),
-                    alpha=False,
-                )
+            result[
+                "hashes"
+            ].append(
+                digest
+            )
 
-                digest = hashlib.sha256(
-                    pix.samples
-                ).hexdigest()
-
-                result[
-                    "page_hashes"
-                ].append(
-                    digest
-                )
-
-                result["rendered"] += 1
-
-            except Exception as e:
-
-                logger.warning(
-                    "Visual page %s failed: %s",
-                    i + 1,
-                    e,
-                )
+            result["rendered"] += 1
 
         doc.close()
 
@@ -592,26 +760,83 @@ def visual_analysis(path: Path):
 
 
 # ============================================================
-# FULL FORENSIC ANALYSIS
+# FULL ANALYSIS
 # ============================================================
 
-def analyze(path):
+def analyze_pdf(path):
 
     logger.info(
-        "🔬 Starting forensic analysis"
+        "🔬 Starting PDF forensic analysis"
     )
 
-    structure = check_pdf(
+    raw = raw_forensics(path)
+
+    metadata = metadata_forensics(
         path
     )
 
-    visual = visual_analysis(
+    document = document_forensics(
         path
     )
+
+    visual = visual_forensics(
+        path
+    )
+
+    # --------------------------------------------------------
+    # Combined score
+    # --------------------------------------------------------
+
+    score = (
+        raw["score"] * 0.40
+        + metadata["score"] * 0.40
+        + document["score"] * 0.20
+    )
+
+    score = round(
+        min(100, score)
+    )
+
+    warnings = []
+
+    for source in (
+        raw,
+        metadata,
+        document,
+    ):
+
+        for warning in source[
+            "warnings"
+        ]:
+
+            if warning not in warnings:
+
+                warnings.append(
+                    warning
+                )
+
+    editors = list(
+        dict.fromkeys(
+            raw["editors"]
+            + metadata["editors"]
+        )
+    )
+
+    if editors:
+
+        score = max(
+            score,
+            70,
+        )
 
     return {
-        "structure": structure,
+        "score": score,
+        "editors": editors,
+        "raw": raw,
+        "metadata": metadata,
+        "document": document,
         "visual": visual,
+        "warnings": warnings,
     }
 
 
@@ -622,38 +847,59 @@ def analyze(path):
 def make_report(
     filename,
     path,
-    analysis,
+    result,
 ):
 
-    s = analysis["structure"]
-    v = analysis["visual"]
+    score = result["score"]
 
-    meta = s["metadata"]
+    if score >= 70:
 
-    creator = (
-        meta.get("creator")
-        or meta.get("Creator")
-        or "N/A"
-    )
+        status = (
+            "🔴 تم العثور على مؤشرات قوية "
+            "لإعادة معالجة/تعديل الملف"
+        )
+
+    elif score >= 40:
+
+        status = (
+            "🟠 توجد مؤشرات تستحق الفحص"
+        )
+
+    else:
+
+        status = (
+            "🟢 لم يتم العثور على مؤشرات قوية"
+        )
+
+    raw = result["raw"]
+    metadata = result["metadata"]
+    document = result["document"]
+    visual = result["visual"]
+
+    info = metadata["info"]
 
     producer = (
-        meta.get("producer")
-        or meta.get("Producer")
-        or "N/A"
+        info.get("/Producer")
+        or info.get("Producer")
+        or "غير موجود"
     )
 
-    created = (
-        meta.get("creationDate")
-        or meta.get("CreationDate")
-        or meta.get("/CreationDate")
-        or "N/A"
+    creator = (
+        info.get("/Creator")
+        or info.get("Creator")
+        or "غير موجود"
+    )
+
+    creation = (
+        info.get("/CreationDate")
+        or info.get("CreationDate")
+        or "غير موجود"
     )
 
     modified = (
-        meta.get("modDate")
-        or meta.get("ModDate")
-        or meta.get("/ModDate")
-        or "N/A"
+        info.get("/ModDate")
+        or info.get("ModDate")
+        or "غير موجود"
     )
 
     size_mb = (
@@ -668,82 +914,124 @@ def make_report(
 
         "",
 
-        f"📄 {filename}",
+        f"📄 الملف: {filename}",
         f"📦 الحجم: {size_mb:.2f} MB",
-        f"📑 الصفحات: {s['pages']}",
+        f"📑 الصفحات: {document['pages']}",
 
         "",
 
-        f"{s['status']}",
-        f"📊 Risk Score: {s['score']}/100",
+        status,
+        f"📊 Risk Score: {score}/100",
 
         "",
+        "🧪 PDF FORENSICS",
 
-        "🔐 تحليل البنية",
+        f"• %%EOF: {raw['eof']}",
+        f"• startxref: {raw['startxref']}",
+        f"• Objects: {raw['objects']}",
+        f"• Streams: {raw['streams']}",
 
-        f"• Text pages: {s['text_pages']}",
-        f"• Scan pages: {s['scan_pages']}",
-        f"• Images: {s['images']}",
-        f"• Fonts: {len(s['fonts'])}",
-        f"• Annotations: {s['annotations']}",
-        f"• Forms: {s['forms']}",
-        f"• Embedded files: "
-        f"{'YES' if s['embedded'] else 'NO'}",
+        f"• Incremental revisions: "
+        f"{'YES' if raw['eof'] > 1 else 'NO'}",
+
         f"• JavaScript: "
-        f"{'YES' if s['javascript'] else 'NO'}",
-        f"• Incremental updates: "
-        f"{'YES' if s['incremental'] else 'NO'}",
-        f"• Signature indicator: "
-        f"{'YES' if s['signature'] else 'NO'}",
+        f"{'YES' if raw['javascript'] else 'NO'}",
+
+        f"• Embedded files: "
+        f"{'YES' if raw['embedded'] else 'NO'}",
+
+        f"• Digital signature indicator: "
+        f"{'YES' if raw['signatures'] else 'NO'}",
 
         "",
+        "🛠️ برامج ظهرت في الملف",
 
-        "📝 Metadata",
-
-        f"• Creator: {str(creator)[:150]}",
-        f"• Producer: {str(producer)[:150]}",
-        f"• Created: {str(created)[:150]}",
-        f"• Modified: {str(modified)[:150]}",
     ]
 
-    if s["warnings"]:
+    if result["editors"]:
 
-        lines += [
-            "",
-            "⚠️ مؤشرات:",
-        ]
-
-        for warning in s[
-            "warnings"
-        ][:12]:
+        for editor in result[
+            "editors"
+        ]:
 
             lines.append(
-                "• " + warning[:220]
+                f"🔴 {editor}"
             )
 
-    lines += [
-        "",
-        "🖼️ Visual rendering",
-        f"• Rendered pages: "
-        f"{v['rendered']}/{v['pages']}",
-    ]
-
-    if v["error"]:
+    else:
 
         lines.append(
-            "• Visual error: "
-            + str(v["error"])[:150]
+            "🟢 لم يتم العثور على محرر معروف"
         )
 
     lines += [
+
         "",
-        "🔑 SHA-256",
+        "📝 PDF INFO",
+
+        f"• Producer: {producer}",
+        f"• Creator: {creator}",
+        f"• CreationDate: {creation}",
+        f"• ModDate: {modified}",
+
+        "",
+        "📄 DOCUMENT",
+
+        f"• Text pages: "
+        f"{document['text_pages']}",
+
+        f"• Scan pages: "
+        f"{document['scan_pages']}",
+
+        f"• Images: "
+        f"{document['images']}",
+
+        f"• Fonts: "
+        f"{len(document['fonts'])}",
+
+        f"• Annotations: "
+        f"{document['annotations']}",
+
+        "",
+        "🖼️ VISUAL",
+
+        f"• Rendered: "
+        f"{visual['rendered']}",
+
+    ]
+
+    if result["warnings"]:
+
+        lines += [
+            "",
+            "⚠️ المؤشرات المكتشفة:",
+        ]
+
+        for warning in result[
+            "warnings"
+        ][:20]:
+
+            lines.append(
+                "• " + warning[:250]
+            )
+
+    lines += [
+
+        "",
+        "🔐 SHA-256",
+
         sha256(path),
 
         "",
-        "⚠️ مهم:",
-        "هذا التحليل يكشف مؤشرات تقنية فقط.",
-        "لا يمكن إثبات التزوير 100% من ملف واحد بدون الأصل.",
+        "⚠️ ملاحظة مهمة:",
+        "وجود Sejda أو أي محرر PDF يعني أن "
+        "الملف تمت معالجته/إعادة حفظه، "
+        "ولا يعني وحده أن المحتوى مزور.",
+
+        "",
+        "الفحص بدون النسخة الأصلية لا يستطيع "
+        "إثبات أن قيمة أو اسمًا معينًا تم تغييره.",
+
         "",
         "By LEX",
     ]
@@ -752,7 +1040,7 @@ def make_report(
 
 
 # ============================================================
-# START
+# /START
 # ============================================================
 
 async def start(
@@ -762,12 +1050,16 @@ async def start(
 
     await update.message.reply_text(
         "🤖 LEX PDF FORENSIC PRO\n\n"
-        "📄 ابعث PDF للتحليل.\n\n"
-        "أفحص البنية، metadata، الخطوط، "
-        "الصور، annotations، JavaScript، "
-        "incremental updates، وrendering.\n\n"
-        "⚠️ النتيجة مؤشر تقني وليست إثباتًا "
-        "قانونيًا للتزوير."
+        "ابعث PDF وأنا نفحص:\n\n"
+        "🔎 PDF structure\n"
+        "🛠️ Sejda / Adobe / Smallpdf وغيرها\n"
+        "📝 Info + XMP metadata\n"
+        "🔄 revisions / xref / EOF\n"
+        "📦 PDF objects\n"
+        "🔤 fonts\n"
+        "🖼️ images / rendering\n\n"
+        "⚠️ النتيجة مؤشرات تقنية وليست "
+        "إثباتًا قانونيًا للتزوير."
     )
 
 
@@ -800,20 +1092,20 @@ async def handle_pdf(
 
         return
 
-    file_size = document.file_size or 0
+    size = document.file_size or 0
 
-    if file_size > MAX_FILE_SIZE:
+    if size > MAX_FILE_SIZE:
 
         await update.message.reply_text(
             f"❌ الملف كبير.\n"
-            f"الحد الأقصى: {MAX_FILE_MB} MB."
+            f"الحد الأقصى {MAX_FILE_MB} MB."
         )
 
         return
 
     workdir = Path(
         tempfile.mkdtemp(
-            prefix="lex_"
+            prefix="lex_pdf_"
         )
     )
 
@@ -829,11 +1121,13 @@ async def handle_pdf(
         )
 
         await update.message.reply_text(
-            "🔍 استلمت الملف.\n"
+            "🔍 استلمت الملف.\n\n"
             "جاري الفحص الجنائي للـPDF..."
         )
 
-        tg_file = await document.get_file()
+        tg_file = (
+            await document.get_file()
+        )
 
         await tg_file.download_to_drive(
             custom_path=str(path)
@@ -841,15 +1135,9 @@ async def handle_pdf(
 
         if not path.exists():
             raise RuntimeError(
-                "Download failed"
+                "PDF download failed"
             )
 
-        if path.stat().st_size == 0:
-            raise RuntimeError(
-                "Empty file"
-            )
-
-        # PDF signature
         with open(
             path,
             "rb",
@@ -862,47 +1150,51 @@ async def handle_pdf(
         ):
 
             await update.message.reply_text(
-                "❌ الملف لا يبدو PDF صالحًا."
+                "❌ الملف ليس PDF صالحًا."
             )
 
             return
 
-        # CPU-heavy work خارج event loop
-        analysis = await asyncio.to_thread(
-            analyze,
+        result = await asyncio.to_thread(
+            analyze_pdf,
             path,
         )
 
         report = make_report(
             filename,
             path,
-            analysis,
+            result,
         )
+
+        # Telegram max message size safety
+        if len(report) > 3900:
+
+            report = (
+                report[:3800]
+                + "\n\n…"
+            )
 
         await update.message.reply_text(
             report
         )
 
         logger.info(
-            "✅ Analysis completed | %s | score=%s",
+            "✅ PDF analyzed | %s | score=%s",
             filename,
-            analysis[
-                "structure"
-            ]["score"],
+            result["score"],
         )
 
     except Exception as e:
 
         logger.exception(
-            "PDF handler failed: %s",
+            "PDF analysis failed: %s",
             e,
         )
 
         try:
 
             await update.message.reply_text(
-                "❌ ماقدرتش نكمل التحليل.\n\n"
-                "الملف ما طيّحش البوت، "
+                "❌ حدث خطأ أثناء التحليل.\n"
                 "جرب PDF آخر."
             )
 
@@ -934,8 +1226,11 @@ async def error_handler(
     ):
 
         logger.critical(
-            "🚨 409 CONFLICT - "
-            "another instance is using BOT_TOKEN"
+            "🚨 TELEGRAM 409 CONFLICT"
+        )
+
+        logger.critical(
+            "Another instance is using BOT_TOKEN."
         )
 
         return
@@ -946,7 +1241,7 @@ async def error_handler(
     ):
 
         logger.warning(
-            "Telegram rate limit: %s",
+            "Telegram rate limit: %s sec",
             error.retry_after,
         )
 
@@ -968,7 +1263,7 @@ async def error_handler(
         return
 
     logger.exception(
-        "Unhandled Telegram error: %s",
+        "Telegram error: %s",
         error,
     )
 
@@ -986,7 +1281,7 @@ def main():
         )
 
     logger.info(
-        "🚀 LEX PDF FORENSIC PRO starting..."
+        "🚀 LEX PDF FORENSIC PRO"
     )
 
     app = (
@@ -1028,4 +1323,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
