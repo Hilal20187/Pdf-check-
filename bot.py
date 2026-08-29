@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import asyncio
 from pathlib import Path
+from datetime import datetime
 
 import fitz
 from pypdf import PdfReader
@@ -44,7 +45,7 @@ logger = logging.getLogger("LEX")
 
 
 # ============================================================
-# KNOWN EXTERNAL EDITORS
+# KNOWN PDF EDITORS
 # ============================================================
 
 KNOWN_EDITORS = {
@@ -72,36 +73,28 @@ KNOWN_EDITORS = {
 # HELPERS
 # ============================================================
 
-def text(value):
+def clean(value):
     if value is None:
         return ""
     return str(value).strip()
 
 
 def find_editors(data):
-
     data = data.lower()
-
     found = []
 
     for key, name in KNOWN_EDITORS.items():
-
-        if key.lower() in data:
-
-            if name not in found:
-                found.append(name)
+        if key.lower() in data and name not in found:
+            found.append(name)
 
     return found
 
 
 def sha256(path):
-
     h = hashlib.sha256()
 
     with open(path, "rb") as f:
-
         while True:
-
             chunk = f.read(1024 * 1024)
 
             if not chunk:
@@ -113,20 +106,72 @@ def sha256(path):
 
 
 # ============================================================
-# RAW PDF ANALYSIS
+# PDF DATE PARSER
+# ============================================================
+
+def parse_pdf_date(value):
+    """
+    Parses common PDF dates:
+
+    D:YYYYMMDDHHmmSS+01'00'
+    D:YYYYMMDDHHmmSSZ
+    """
+
+    if not value:
+        return None
+
+    value = clean(value)
+
+    if value.startswith("D:"):
+        value = value[2:]
+
+    # Remove strange characters while preserving timezone
+    match = re.match(
+        r"^(\d{4})"
+        r"(?:(\d{2}))?"
+        r"(?:(\d{2}))?"
+        r"(?:(\d{2}))?"
+        r"(?:(\d{2}))?"
+        r"(?:(\d{2}))?"
+        r"(Z|[+-]\d{2}'?\d{2}'?)?$",
+        value,
+    )
+
+    if not match:
+        return None
+
+    year = int(match.group(1))
+    month = int(match.group(2) or 1)
+    day = int(match.group(3) or 1)
+    hour = int(match.group(4) or 0)
+    minute = int(match.group(5) or 0)
+    second = int(match.group(6) or 0)
+
+    try:
+        return datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        )
+    except ValueError:
+        return None
+
+
+# ============================================================
+# RAW FORENSICS
 # ============================================================
 
 def analyze_raw(path):
 
     raw = path.read_bytes()
 
-    try:
-        raw_text = raw.decode(
-            "latin-1",
-            errors="ignore",
-        )
-    except Exception:
-        raw_text = ""
+    raw_text = raw.decode(
+        "latin-1",
+        errors="ignore",
+    )
 
     result = {
         "eof": len(
@@ -171,7 +216,7 @@ def analyze_raw(path):
     }
 
     # --------------------------------------------------------
-    # External editor fingerprints
+    # External editors
     # --------------------------------------------------------
 
     if result["editors"]:
@@ -179,25 +224,23 @@ def analyze_raw(path):
         for editor in result["editors"]:
 
             result["evidence"].append(
-                f"وجدت بصمة برنامج خارجي: {editor}"
+                f"بصمة برنامج خارجي: {editor}"
             )
 
-        # Strong signal that PDF was processed.
-        result["score"] += 45
+        result["score"] += 50
 
     # --------------------------------------------------------
-    # Incremental revisions
+    # Multiple revisions
     # --------------------------------------------------------
 
     if result["eof"] > 1:
 
         result["evidence"].append(
-            f"الملف يحتوي على {result['eof']} %%EOF؛ "
-            "هذا قد يشير إلى عدة revisions."
+            f"تم العثور على {result['eof']} %%EOF."
         )
 
         result["score"] += min(
-            20,
+            25,
             (result["eof"] - 1) * 5,
         )
 
@@ -222,13 +265,13 @@ def analyze_raw(path):
         result["javascript"] = True
 
         result["evidence"].append(
-            "JavaScript موجود داخل PDF."
+            "JavaScript موجود داخل الملف."
         )
 
         result["score"] += 15
 
     # --------------------------------------------------------
-    # Embedded files
+    # Embedded
     # --------------------------------------------------------
 
     if (
@@ -239,7 +282,7 @@ def analyze_raw(path):
         result["embedded"] = True
 
         result["evidence"].append(
-            "يوجد embedded file/object."
+            "يوجد Embedded File/Object."
         )
 
         result["score"] += 3
@@ -265,7 +308,7 @@ def analyze_raw(path):
 
 
 # ============================================================
-# METADATA / XMP
+# METADATA
 # ============================================================
 
 def analyze_metadata(path):
@@ -274,6 +317,12 @@ def analyze_metadata(path):
         "info": {},
         "xmp": "",
         "editors": [],
+        "creation_raw": "",
+        "modified_raw": "",
+        "creation_date": None,
+        "modified_date": None,
+        "date_difference": False,
+        "difference_seconds": None,
         "score": 0,
         "evidence": [],
     }
@@ -293,8 +342,8 @@ def analyze_metadata(path):
 
             for key, value in reader.metadata.items():
 
-                key = text(key)
-                value = text(value)
+                key = clean(key)
+                value = clean(value)
 
                 if key and value:
 
@@ -303,7 +352,7 @@ def analyze_metadata(path):
     except Exception as e:
 
         logger.warning(
-            "Info metadata error: %s",
+            "Metadata error: %s",
             e,
         )
 
@@ -316,6 +365,7 @@ def analyze_metadata(path):
         doc = fitz.open(str(path))
 
         try:
+
             xmp = doc.get_xml_metadata()
 
             if xmp:
@@ -334,7 +384,93 @@ def analyze_metadata(path):
         )
 
     # --------------------------------------------------------
-    # Search external applications
+    # Get CreationDate
+    # --------------------------------------------------------
+
+    for key in (
+        "/CreationDate",
+        "CreationDate",
+        "creationDate",
+    ):
+
+        if key in result["info"]:
+
+            result["creation_raw"] = (
+                result["info"][key]
+            )
+
+            break
+
+    # --------------------------------------------------------
+    # Get ModDate
+    # --------------------------------------------------------
+
+    for key in (
+        "/ModDate",
+        "ModDate",
+        "modDate",
+    ):
+
+        if key in result["info"]:
+
+            result["modified_raw"] = (
+                result["info"][key]
+            )
+
+            break
+
+    result["creation_date"] = parse_pdf_date(
+        result["creation_raw"]
+    )
+
+    result["modified_date"] = parse_pdf_date(
+        result["modified_raw"]
+    )
+
+    # ========================================================
+    # STRICT DATE RULE
+    # ========================================================
+
+    if (
+        result["creation_date"]
+        and result["modified_date"]
+    ):
+
+        difference = (
+            result["modified_date"]
+            - result["creation_date"]
+        )
+
+        result["difference_seconds"] = (
+            abs(difference.total_seconds())
+        )
+
+        # ANY difference = suspicious
+        if (
+            result["creation_date"]
+            != result["modified_date"]
+        ):
+
+            result["date_difference"] = True
+
+            result["score"] = 100
+
+            result["evidence"].append(
+                "🔴 CreationDate و ModDate مختلفان."
+            )
+
+            result["evidence"].append(
+                "🔴 تم اعتبار الملف MODIFIED "
+                "حسب قاعدة الفحص الصارمة."
+            )
+
+            result["evidence"].append(
+                f"فرق التوقيت: "
+                f"{result['difference_seconds']:.0f} ثانية."
+            )
+
+    # --------------------------------------------------------
+    # External editor in metadata
     # --------------------------------------------------------
 
     info_text = "\n".join(
@@ -357,88 +493,13 @@ def analyze_metadata(path):
         for editor in result["editors"]:
 
             result["evidence"].append(
-                f"Metadata/XMP يحتوي على: {editor}"
+                f"Metadata/XMP: {editor}"
             )
 
-        result["score"] += 50
-
-    # --------------------------------------------------------
-    # Dates
-    # --------------------------------------------------------
-
-    creation = ""
-
-    modified = ""
-
-    for key in (
-        "/CreationDate",
-        "CreationDate",
-        "creationDate",
-    ):
-
-        if key in result["info"]:
-
-            creation = result[
-                "info"
-            ][key]
-
-            break
-
-    for key in (
-        "/ModDate",
-        "ModDate",
-        "modDate",
-    ):
-
-        if key in result["info"]:
-
-            modified = result[
-                "info"
-            ][key]
-
-            break
-
-    if creation and modified:
-
-        if creation != modified:
-
-            result["evidence"].append(
-                "CreationDate مختلف عن ModDate."
-            )
-
-            result["score"] += 10
-
-    # --------------------------------------------------------
-    # XMP CreatorTool
-    # --------------------------------------------------------
-
-    xmp = result["xmp"]
-
-    creator_matches = re.findall(
-        r"<(?:[^:>]+:)?CreatorTool[^>]*>"
-        r"(.*?)"
-        r"</(?:[^:>]+:)?CreatorTool>",
-        xmp,
-        re.I | re.S,
-    )
-
-    if creator_matches:
-
-        creator = " ".join(
-            creator_matches
+        result["score"] = max(
+            result["score"],
+            90,
         )
-
-        editors = find_editors(
-            creator
-        )
-
-        for editor in editors:
-
-            result["evidence"].append(
-                f"XMP CreatorTool: {editor}"
-            )
-
-            result["score"] += 20
 
     result["score"] = min(
         100,
@@ -449,7 +510,7 @@ def analyze_metadata(path):
 
 
 # ============================================================
-# PAGE / FONT / IMAGE ANALYSIS
+# DOCUMENT ANALYSIS
 # ============================================================
 
 def analyze_document(path):
@@ -485,18 +546,16 @@ def analyze_document(path):
 
             page_number = i + 1
 
-            extracted = (
+            page_text = (
                 page.get_text("text")
                 or ""
             ).strip()
 
-            if len(extracted) >= 10:
+            if len(page_text) >= 10:
 
                 result[
                     "text_pages"
                 ] += 1
-
-            images = []
 
             try:
 
@@ -509,10 +568,10 @@ def analyze_document(path):
                 )
 
             except Exception:
-                pass
+                images = []
 
             if (
-                len(extracted) < 10
+                len(page_text) < 10
                 and images
             ):
 
@@ -520,7 +579,7 @@ def analyze_document(path):
                     "scan_pages"
                 ] += 1
 
-            page_fonts = set()
+            fonts = set()
 
             try:
 
@@ -530,13 +589,13 @@ def analyze_document(path):
 
                     if len(font) > 3:
 
-                        name = text(
+                        name = clean(
                             font[3]
                         )
 
                         if name:
 
-                            page_fonts.add(
+                            fonts.add(
                                 name
                             )
 
@@ -549,7 +608,7 @@ def analyze_document(path):
 
             result[
                 "font_by_page"
-            ][page_number] = page_fonts
+            ][page_number] = fonts
 
             try:
 
@@ -582,58 +641,14 @@ def analyze_document(path):
             except Exception:
                 pass
 
-    # --------------------------------------------------------
-    # Font inconsistency
-    # --------------------------------------------------------
-
-    page_font_sets = [
-        fonts
-        for fonts in result[
-            "font_by_page"
-        ].values()
-        if fonts
-    ]
-
     if len(result["fonts"]) >= 10:
 
         result["evidence"].append(
-            f"عدد الخطوط المختلفـة مرتفع: "
+            f"عدد الخطوط مرتفع: "
             f"{len(result['fonts'])}"
         )
 
         result["score"] += 5
-
-    # Look for a font appearing on only one page.
-    if len(page_font_sets) >= 2:
-
-        frequency = {}
-
-        for fonts in page_font_sets:
-
-            for font in fonts:
-
-                frequency[font] = (
-                    frequency.get(font, 0)
-                    + 1
-                )
-
-        rare_fonts = [
-            font
-            for font, count
-            in frequency.items()
-            if count == 1
-        ]
-
-        if rare_fonts:
-
-            result["evidence"].append(
-                "وجدت خطوطًا تظهر في صفحة واحدة فقط."
-            )
-
-            result["score"] += min(
-                8,
-                len(rare_fonts) * 2,
-            )
 
     result["score"] = min(
         100,
@@ -644,70 +659,7 @@ def analyze_document(path):
 
 
 # ============================================================
-# VISUAL RENDER
-# ============================================================
-
-def visual_analysis(path):
-
-    result = {
-        "rendered": 0,
-        "page_hashes": [],
-        "error": None,
-    }
-
-    doc = None
-
-    try:
-
-        doc = fitz.open(str(path))
-
-        pages = min(
-            doc.page_count,
-            MAX_PAGES,
-        )
-
-        for i in range(pages):
-
-            page = doc[i]
-
-            pix = page.get_pixmap(
-                matrix=fitz.Matrix(
-                    1.5,
-                    1.5,
-                ),
-                alpha=False,
-            )
-
-            digest = hashlib.sha256(
-                pix.samples
-            ).hexdigest()
-
-            result[
-                "page_hashes"
-            ].append(
-                digest
-            )
-
-            result["rendered"] += 1
-
-        doc.close()
-
-    except Exception as e:
-
-        result["error"] = str(e)
-
-        if doc:
-
-            try:
-                doc.close()
-            except Exception:
-                pass
-
-    return result
-
-
-# ============================================================
-# MAIN FORENSIC ENGINE
+# FULL FORENSIC SCAN
 # ============================================================
 
 def forensic_scan(path):
@@ -719,10 +671,6 @@ def forensic_scan(path):
     )
 
     document = analyze_document(
-        path
-    )
-
-    visual = visual_analysis(
         path
     )
 
@@ -750,55 +698,52 @@ def forensic_scan(path):
     )
 
     # --------------------------------------------------------
-    # Weighted score
+    # IMPORTANT:
+    # CreationDate != ModDate
+    # overrides everything.
     # --------------------------------------------------------
 
-    score = (
-        raw["score"] * 0.45
-        + metadata["score"] * 0.40
-        + document["score"] * 0.15
-    )
+    if metadata["date_difference"]:
 
-    score = round(
-        min(100, score)
-    )
-
-    # Known editor is a particularly strong
-    # "processed by external software" signal.
-    if editors:
-
-        score = max(
-            score,
-            80,
-        )
-
-    # --------------------------------------------------------
-    # Classification
-    # --------------------------------------------------------
-
-    if editors:
+        score = 100
 
         status = (
-            "🔴 احتمال كبير للتعديل"
+            "🔴 MODIFIED — غير مطابق"
         )
 
-    elif score >= 65:
+    elif editors:
+
+        score = 90
 
         status = (
-            "🔴 مؤشرات قوية على التعديل"
-        )
-
-    elif score >= 35:
-
-        status = (
-            "🟠 احتمال وجود تعديل"
+            "🔴 تمت معالجة الملف ببرنامج خارجي"
         )
 
     else:
 
-        status = (
-            "🟢 لا توجد مؤشرات قوية"
+        score = round(
+            raw["score"] * 0.50
+            + metadata["score"] * 0.35
+            + document["score"] * 0.15
         )
+
+        if score >= 65:
+
+            status = (
+                "🔴 مؤشرات قوية على التعديل"
+            )
+
+        elif score >= 35:
+
+            status = (
+                "🟠 احتمال وجود تعديل"
+            )
+
+        else:
+
+            status = (
+                "🟢 لا توجد مؤشرات قوية"
+            )
 
     return {
         "score": score,
@@ -808,7 +753,6 @@ def forensic_scan(path):
         "raw": raw,
         "metadata": metadata,
         "document": document,
-        "visual": visual,
     }
 
 
@@ -822,10 +766,9 @@ def make_report(
     result,
 ):
 
-    raw = result["raw"]
     metadata = result["metadata"]
+    raw = result["raw"]
     document = result["document"]
-    visual = result["visual"]
 
     info = metadata["info"]
 
@@ -842,14 +785,12 @@ def make_report(
     )
 
     creation = (
-        info.get("/CreationDate")
-        or info.get("CreationDate")
+        metadata["creation_raw"]
         or "غير موجود"
     )
 
     modified = (
-        info.get("/ModDate")
-        or info.get("ModDate")
+        metadata["modified_raw"]
         or "غير موجود"
     )
 
@@ -874,7 +815,6 @@ def make_report(
 
         "",
         "🛠️ المصدر / البرامج",
-
     ]
 
     if result["editors"]:
@@ -890,7 +830,7 @@ def make_report(
     else:
 
         lines.append(
-            "🟢 لم يتم العثور على بصمة محرر معروف"
+            "🟢 لا توجد بصمة محرر معروف"
         )
 
     lines += [
@@ -903,8 +843,37 @@ def make_report(
         f"• CreationDate: {creation}",
         f"• ModDate: {modified}",
 
+    ]
+
+    # --------------------------------------------------------
+    # DATE ALERT
+    # --------------------------------------------------------
+
+    if metadata["date_difference"]:
+
+        seconds = (
+            metadata["difference_seconds"]
+            or 0
+        )
+
+        lines += [
+
+            "",
+            "🚨 DATE FORENSICS",
+
+            "🔴 CreationDate ≠ ModDate",
+
+            f"⏱️ الفرق: {seconds:.0f} ثانية",
+
+            "🔴 حسب قاعدة LEX الصارمة:",
+            "الملف MODIFIED / غير مطابق.",
+
+        ]
+
+    lines += [
+
         "",
-        "🔬 Structure",
+        "🔬 PDF Structure",
 
         f"• Objects: {raw['objects']}",
         f"• Streams: {raw['streams']}",
@@ -920,9 +889,6 @@ def make_report(
 
         f"• Embedded files: "
         f"{'YES' if raw['embedded'] else 'NO'}",
-
-        f"• Signature indicator: "
-        f"{'YES' if raw['signature'] else 'NO'}",
 
         "",
         "📄 Content",
@@ -950,10 +916,10 @@ def make_report(
 
         for evidence in result[
             "evidence"
-        ][:15]:
+        ][:20]:
 
             lines.append(
-                "• " + evidence[:240]
+                "• " + evidence[:250]
             )
 
     else:
@@ -969,11 +935,11 @@ def make_report(
         sha256(path),
 
         "",
-        "⚠️ ملاحظة:",
-        "هذا النظام يكشف آثار المعالجة "
-        "والتعديل التقني. بدون النسخة الأصلية "
-        "لا يمكن إثبات أن معلومة معينة "
-        "تم تغييرها بنسبة 100%.",
+        "⚠️ تنبيه:",
+        "هذه نتيجة فحص تقني. اختلاف CreationDate "
+        "وModDate يعني أن الملف يحمل تاريخ تعديل "
+        "مختلفًا عن تاريخ الإنشاء، لكنه لا يثبت "
+        "بمفرده أن محتوى الوثيقة تم تزويره.",
 
         "",
         "By LEX",
@@ -983,7 +949,7 @@ def make_report(
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 async def start(
@@ -994,15 +960,12 @@ async def start(
     await update.message.reply_text(
         "🤖 LEX PDF FORENSIC PRO\n\n"
         "ابعث PDF للتحليل.\n\n"
-        "🔎 أبحث عن آثار Sejda وSmallpdf "
-        "وAdobe وغيرها\n"
-        "📝 PDF Info + XMP\n"
+        "🔴 أي فرق بين CreationDate و ModDate "
+        "سيتم اعتباره MODIFIED حسب النظام الصارم.\n\n"
+        "🛠️ Sejda / Adobe / Smallpdf وغيرها\n"
         "🔄 revisions / xref / EOF\n"
-        "📦 objects / streams\n"
-        "🔤 fonts\n"
-        "🖼️ rendering\n\n"
-        "⚠️ النتيجة تقنية وليست إثباتًا "
-        "قانونيًا للتزوير."
+        "📝 Metadata + XMP\n"
+        "🔤 Fonts / Objects / Images"
     )
 
 
@@ -1041,14 +1004,14 @@ async def handle_pdf(
 
         await update.message.reply_text(
             f"❌ الملف كبير.\n"
-            f"الحد الأقصى: {MAX_FILE_MB} MB."
+            f"الحد الأقصى {MAX_FILE_MB} MB."
         )
 
         return
 
     workdir = Path(
         tempfile.mkdtemp(
-            prefix="lex_"
+            prefix="lex_pdf_"
         )
     )
 
@@ -1065,7 +1028,7 @@ async def handle_pdf(
 
         await update.message.reply_text(
             "🔍 استلمت الملف.\n"
-            "جاري التحليل الجنائي..."
+            "جاري الفحص..."
         )
 
         tg_file = (
@@ -1116,22 +1079,20 @@ async def handle_pdf(
         )
 
         logger.info(
-            "Analysis complete | score=%s | editors=%s",
+            "PDF analyzed | score=%s",
             result["score"],
-            result["editors"],
         )
 
     except Exception as e:
 
         logger.exception(
-            "PDF analysis failed: %s",
-            e,
+            "PDF analysis failed"
         )
 
         try:
 
             await update.message.reply_text(
-                "❌ حدث خطأ أثناء تحليل الملف."
+                "❌ حدث خطأ أثناء تحليل PDF."
             )
 
         except Exception:
@@ -1162,8 +1123,8 @@ async def error_handler(
     ):
 
         logger.critical(
-            "🚨 409 CONFLICT: "
-            "another instance is using BOT_TOKEN"
+            "🚨 409 CONFLICT — "
+            "Another instance is using BOT_TOKEN."
         )
 
         return
@@ -1174,7 +1135,7 @@ async def error_handler(
     ):
 
         logger.warning(
-            "Rate limited: %s",
+            "Telegram rate limit: %s",
             error.retry_after,
         )
 
@@ -1196,13 +1157,12 @@ async def error_handler(
         return
 
     logger.exception(
-        "Telegram error: %s",
-        error,
+        "Telegram error"
     )
 
 
 # ============================================================
-# RUN
+# MAIN
 # ============================================================
 
 def main():
@@ -1212,6 +1172,10 @@ def main():
         raise RuntimeError(
             "BOT_TOKEN missing"
         )
+
+    logger.info(
+        "🚀 LEX PDF FORENSIC PRO"
+    )
 
     app = (
         Application.builder()
@@ -1242,7 +1206,7 @@ def main():
     )
 
     logger.info(
-        "🚀 LEX PDF FORENSIC PRO READY"
+        "✅ Bot ready"
     )
 
     app.run_polling(
