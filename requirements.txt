@@ -1,2 +1,2 @@
-pyTelegramBotAPI
-pypdf
+python-telegram-bot==22.5
+pypdf==6.0.0
