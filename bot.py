@@ -12,12 +12,7 @@ from pypdf import PdfReader
 
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import (
-    Conflict,
-    NetworkError,
-    TimedOut,
-    RetryAfter,
-)
+from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,7 +27,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
+MAX_FILE_MB = 25
 MAX_FILE_SIZE = MAX_FILE_MB * 1024 * 1024
 MAX_PAGES = 50
 
@@ -49,14 +44,13 @@ logger = logging.getLogger("LEX")
 
 
 # ============================================================
-# KNOWN PDF EDITORS / REWRITERS
+# KNOWN EXTERNAL EDITORS
 # ============================================================
 
-EDITORS = {
+KNOWN_EDITORS = {
     "sejda": "Sejda",
     "smallpdf": "Smallpdf",
     "ilovepdf": "iLovePDF",
-    "ilovePDF": "iLovePDF",
     "pdfescape": "PDFescape",
     "nitro": "Nitro PDF",
     "foxit": "Foxit PDF",
@@ -69,8 +63,8 @@ EDITORS = {
     "canva": "Canva",
     "pdfsam": "PDFsam",
     "libreoffice": "LibreOffice",
-    "wkhtmltopdf": "wkhtmltopdf",
-    "weasyprint": "WeasyPrint",
+    "master pdf editor": "Master PDF Editor",
+    "pdftk": "PDFtk",
 }
 
 
@@ -78,22 +72,22 @@ EDITORS = {
 # HELPERS
 # ============================================================
 
-def clean(value):
+def text(value):
     if value is None:
         return ""
-
     return str(value).strip()
 
 
-def find_editors(text):
+def find_editors(data):
+
+    data = data.lower()
 
     found = []
 
-    lower = text.lower()
+    for key, name in KNOWN_EDITORS.items():
 
-    for key, name in EDITORS.items():
+        if key.lower() in data:
 
-        if key.lower() in lower:
             if name not in found:
                 found.append(name)
 
@@ -119,115 +113,12 @@ def sha256(path):
 
 
 # ============================================================
-# RAW PDF FORENSICS
+# RAW PDF ANALYSIS
 # ============================================================
 
-def raw_forensics(path):
+def analyze_raw(path):
 
     raw = path.read_bytes()
-
-    result = {
-        "size": len(raw),
-        "eof": 0,
-        "xref": 0,
-        "startxref": 0,
-        "objects": 0,
-        "streams": 0,
-        "javascript": False,
-        "embedded": False,
-        "signatures": False,
-        "editors": [],
-        "warnings": [],
-        "score": 0,
-    }
-
-    # --------------------------------------------------------
-    # EOF / revisions
-    # --------------------------------------------------------
-
-    result["eof"] = len(
-        re.findall(
-            rb"%%EOF",
-            raw,
-        )
-    )
-
-    result["startxref"] = len(
-        re.findall(
-            rb"startxref",
-            raw,
-        )
-    )
-
-    result["xref"] = len(
-        re.findall(
-            rb"(?:^|\n)xref(?:\s|\n)",
-            raw,
-            re.MULTILINE,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Objects
-    # --------------------------------------------------------
-
-    result["objects"] = len(
-        re.findall(
-            rb"\n\d+\s+\d+\s+obj\b",
-            raw,
-        )
-    )
-
-    result["streams"] = len(
-        re.findall(
-            rb"\bstream\b",
-            raw,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Dangerous / special objects
-    # --------------------------------------------------------
-
-    if (
-        b"/JavaScript" in raw
-        or b"/JavaScript " in raw
-        or b"/JS " in raw
-        or b"/JS/" in raw
-    ):
-
-        result["javascript"] = True
-
-        result["warnings"].append(
-            "JavaScript موجود داخل الملف."
-        )
-
-        result["score"] += 15
-
-    if (
-        b"/EmbeddedFile" in raw
-        or b"/Filespec" in raw
-    ):
-
-        result["embedded"] = True
-
-        result["warnings"].append(
-            "ملف يحتوي على embedded objects/files."
-        )
-
-        result["score"] += 3
-
-    if (
-        b"/ByteRange" in raw
-        or b"/adbe.pkcs7" in raw
-        or b"/Adobe.PPKLite" in raw
-    ):
-
-        result["signatures"] = True
-
-    # --------------------------------------------------------
-    # Editor fingerprints
-    # --------------------------------------------------------
 
     try:
         raw_text = raw.decode(
@@ -237,31 +128,72 @@ def raw_forensics(path):
     except Exception:
         raw_text = ""
 
-    result["editors"] = find_editors(
-        raw_text
-    )
+    result = {
+        "eof": len(
+            re.findall(
+                rb"%%EOF",
+                raw,
+            )
+        ),
+        "startxref": len(
+            re.findall(
+                rb"startxref",
+                raw,
+            )
+        ),
+        "xref": len(
+            re.findall(
+                rb"(?:^|\n)xref(?:\s|\n)",
+                raw,
+                re.MULTILINE,
+            )
+        ),
+        "objects": len(
+            re.findall(
+                rb"\n\d+\s+\d+\s+obj\b",
+                raw,
+            )
+        ),
+        "streams": len(
+            re.findall(
+                rb"\bstream\b",
+                raw,
+            )
+        ),
+        "editors": find_editors(
+            raw_text
+        ),
+        "javascript": False,
+        "embedded": False,
+        "signature": False,
+        "score": 0,
+        "evidence": [],
+    }
+
+    # --------------------------------------------------------
+    # External editor fingerprints
+    # --------------------------------------------------------
 
     if result["editors"]:
 
         for editor in result["editors"]:
 
-            result["warnings"].append(
-                f"أثر برنامج PDF: {editor}"
+            result["evidence"].append(
+                f"وجدت بصمة برنامج خارجي: {editor}"
             )
 
-        # Strong indicator of processing,
-        # NOT automatic proof of fraud.
-        result["score"] += 35
+        # Strong signal that PDF was processed.
+        result["score"] += 45
 
     # --------------------------------------------------------
-    # Incremental updates
+    # Incremental revisions
     # --------------------------------------------------------
 
     if result["eof"] > 1:
 
-        result["warnings"].append(
-            f"عدة PDF revisions محتملة: "
-            f"{result['eof']} %%EOF"
+        result["evidence"].append(
+            f"الملف يحتوي على {result['eof']} %%EOF؛ "
+            "هذا قد يشير إلى عدة revisions."
         )
 
         result["score"] += min(
@@ -271,12 +203,58 @@ def raw_forensics(path):
 
     if result["startxref"] > 1:
 
-        result["warnings"].append(
-            f"عدة startxref: "
-            f"{result['startxref']}"
+        result["evidence"].append(
+            f"تم العثور على {result['startxref']} startxref."
         )
 
         result["score"] += 5
+
+    # --------------------------------------------------------
+    # JavaScript
+    # --------------------------------------------------------
+
+    if (
+        b"/JavaScript" in raw
+        or b"/JS " in raw
+        or b"/JS/" in raw
+    ):
+
+        result["javascript"] = True
+
+        result["evidence"].append(
+            "JavaScript موجود داخل PDF."
+        )
+
+        result["score"] += 15
+
+    # --------------------------------------------------------
+    # Embedded files
+    # --------------------------------------------------------
+
+    if (
+        b"/EmbeddedFile" in raw
+        or b"/Filespec" in raw
+    ):
+
+        result["embedded"] = True
+
+        result["evidence"].append(
+            "يوجد embedded file/object."
+        )
+
+        result["score"] += 3
+
+    # --------------------------------------------------------
+    # Digital signature indicator
+    # --------------------------------------------------------
+
+    if (
+        b"/ByteRange" in raw
+        or b"/adbe.pkcs7" in raw
+        or b"/Adobe.PPKLite" in raw
+    ):
+
+        result["signature"] = True
 
     result["score"] = min(
         100,
@@ -287,21 +265,21 @@ def raw_forensics(path):
 
 
 # ============================================================
-# PDF INFO + XMP
+# METADATA / XMP
 # ============================================================
 
-def metadata_forensics(path):
+def analyze_metadata(path):
 
     result = {
         "info": {},
         "xmp": "",
         "editors": [],
-        "warnings": [],
         "score": 0,
+        "evidence": [],
     }
 
     # --------------------------------------------------------
-    # pypdf Info
+    # PDF Info
     # --------------------------------------------------------
 
     try:
@@ -311,14 +289,12 @@ def metadata_forensics(path):
             strict=False,
         )
 
-        metadata = reader.metadata
+        if reader.metadata:
 
-        if metadata:
+            for key, value in reader.metadata.items():
 
-            for key, value in metadata.items():
-
-                key = clean(key)
-                value = clean(value)
+                key = text(key)
+                value = text(value)
 
                 if key and value:
 
@@ -327,12 +303,12 @@ def metadata_forensics(path):
     except Exception as e:
 
         logger.warning(
-            "Metadata reader failed: %s",
+            "Info metadata error: %s",
             e,
         )
 
     # --------------------------------------------------------
-    # PyMuPDF XMP
+    # XMP
     # --------------------------------------------------------
 
     try:
@@ -340,11 +316,9 @@ def metadata_forensics(path):
         doc = fitz.open(str(path))
 
         try:
-
             xmp = doc.get_xml_metadata()
 
             if xmp:
-
                 result["xmp"] = xmp
 
         except Exception:
@@ -355,12 +329,12 @@ def metadata_forensics(path):
     except Exception as e:
 
         logger.warning(
-            "XMP extraction failed: %s",
+            "XMP error: %s",
             e,
         )
 
     # --------------------------------------------------------
-    # Combined metadata
+    # Search external applications
     # --------------------------------------------------------
 
     info_text = "\n".join(
@@ -382,33 +356,25 @@ def metadata_forensics(path):
 
         for editor in result["editors"]:
 
-            result["warnings"].append(
-                f"Metadata/XMP يشير إلى: {editor}"
+            result["evidence"].append(
+                f"Metadata/XMP يحتوي على: {editor}"
             )
 
-        result["score"] += 40
+        result["score"] += 50
 
     # --------------------------------------------------------
-    # Creation / Modification
+    # Dates
     # --------------------------------------------------------
-
-    creation_keys = [
-        "/CreationDate",
-        "CreationDate",
-        "creationDate",
-    ]
-
-    modification_keys = [
-        "/ModDate",
-        "ModDate",
-        "modDate",
-    ]
 
     creation = ""
 
     modified = ""
 
-    for key in creation_keys:
+    for key in (
+        "/CreationDate",
+        "CreationDate",
+        "creationDate",
+    ):
 
         if key in result["info"]:
 
@@ -418,7 +384,11 @@ def metadata_forensics(path):
 
             break
 
-    for key in modification_keys:
+    for key in (
+        "/ModDate",
+        "ModDate",
+        "modDate",
+    ):
 
         if key in result["info"]:
 
@@ -432,19 +402,19 @@ def metadata_forensics(path):
 
         if creation != modified:
 
-            result["warnings"].append(
-                "CreationDate و ModDate مختلفان."
+            result["evidence"].append(
+                "CreationDate مختلف عن ModDate."
             )
 
             result["score"] += 10
 
     # --------------------------------------------------------
-    # XMP fields
+    # XMP CreatorTool
     # --------------------------------------------------------
 
     xmp = result["xmp"]
 
-    xmp_creator = re.findall(
+    creator_matches = re.findall(
         r"<(?:[^:>]+:)?CreatorTool[^>]*>"
         r"(.*?)"
         r"</(?:[^:>]+:)?CreatorTool>",
@@ -452,48 +422,20 @@ def metadata_forensics(path):
         re.I | re.S,
     )
 
-    xmp_producer = re.findall(
-        r"<(?:[^:>]+:)?Producer[^>]*>"
-        r"(.*?)"
-        r"</(?:[^:>]+:)?Producer>",
-        xmp,
-        re.I | re.S,
-    )
+    if creator_matches:
 
-    if xmp_creator:
-
-        creator_text = " ".join(
-            xmp_creator
+        creator = " ".join(
+            creator_matches
         )
 
         editors = find_editors(
-            creator_text
+            creator
         )
 
-        if editors:
+        for editor in editors:
 
-            result["warnings"].append(
-                "XMP CreatorTool: "
-                + ", ".join(editors)
-            )
-
-            result["score"] += 20
-
-    if xmp_producer:
-
-        producer_text = " ".join(
-            xmp_producer
-        )
-
-        editors = find_editors(
-            producer_text
-        )
-
-        if editors:
-
-            result["warnings"].append(
-                "XMP Producer: "
-                + ", ".join(editors)
+            result["evidence"].append(
+                f"XMP CreatorTool: {editor}"
             )
 
             result["score"] += 20
@@ -507,22 +449,21 @@ def metadata_forensics(path):
 
 
 # ============================================================
-# DOCUMENT STRUCTURE
+# PAGE / FONT / IMAGE ANALYSIS
 # ============================================================
 
-def document_forensics(path):
+def analyze_document(path):
 
     result = {
         "pages": 0,
         "text_pages": 0,
         "scan_pages": 0,
-        "fonts": set(),
         "images": 0,
         "annotations": 0,
-        "forms": False,
-        "page_details": [],
-        "warnings": [],
+        "fonts": set(),
+        "font_by_page": {},
         "score": 0,
+        "evidence": [],
     }
 
     doc = None
@@ -538,16 +479,18 @@ def document_forensics(path):
             MAX_PAGES,
         )
 
-        for index in range(pages):
+        for i in range(pages):
 
-            page = doc[index]
+            page = doc[i]
 
-            text = (
+            page_number = i + 1
+
+            extracted = (
                 page.get_text("text")
                 or ""
             ).strip()
 
-            if len(text) >= 10:
+            if len(extracted) >= 10:
 
                 result[
                     "text_pages"
@@ -569,7 +512,7 @@ def document_forensics(path):
                 pass
 
             if (
-                len(text) < 10
+                len(extracted) < 10
                 and images
             ):
 
@@ -577,7 +520,7 @@ def document_forensics(path):
                     "scan_pages"
                 ] += 1
 
-            fonts = set()
+            page_fonts = set()
 
             try:
 
@@ -587,12 +530,16 @@ def document_forensics(path):
 
                     if len(font) > 3:
 
-                        name = clean(
+                        name = text(
                             font[3]
                         )
 
                         if name:
-                            fonts.add(name)
+
+                            page_fonts.add(
+                                name
+                            )
+
                             result[
                                 "fonts"
                             ].add(name)
@@ -600,7 +547,9 @@ def document_forensics(path):
             except Exception:
                 pass
 
-            annot_count = 0
+            result[
+                "font_by_page"
+            ][page_number] = page_fonts
 
             try:
 
@@ -609,7 +558,7 @@ def document_forensics(path):
                 if annots:
 
                     for _ in annots:
-                        annot_count += 1
+
                         result[
                             "annotations"
                         ] += 1
@@ -617,54 +566,12 @@ def document_forensics(path):
             except Exception:
                 pass
 
-            result[
-                "page_details"
-            ].append({
-                "page": index + 1,
-                "text_length": len(text),
-                "images": len(images),
-                "fonts": sorted(fonts),
-                "annotations": annot_count,
-            })
-
-        # Forms
-        try:
-
-            widgets = []
-
-            for page in doc:
-
-                try:
-
-                    for widget in (
-                        page.widgets()
-                        or []
-                    ):
-
-                        widgets.append(widget)
-
-                except Exception:
-                    pass
-
-            if widgets:
-
-                result["forms"] = True
-
-                result["warnings"].append(
-                    "AcroForm fields موجودة."
-                )
-
-                result["score"] += 3
-
-        except Exception:
-            pass
-
         doc.close()
 
     except Exception as e:
 
         logger.warning(
-            "Document analysis failed: %s",
+            "Document analysis error: %s",
             e,
         )
 
@@ -676,17 +583,57 @@ def document_forensics(path):
                 pass
 
     # --------------------------------------------------------
-    # Font consistency
+    # Font inconsistency
     # --------------------------------------------------------
 
-    if len(result["fonts"]) > 12:
+    page_font_sets = [
+        fonts
+        for fonts in result[
+            "font_by_page"
+        ].values()
+        if fonts
+    ]
 
-        result["warnings"].append(
-            f"عدد الخطوط مرتفع: "
+    if len(result["fonts"]) >= 10:
+
+        result["evidence"].append(
+            f"عدد الخطوط المختلفـة مرتفع: "
             f"{len(result['fonts'])}"
         )
 
         result["score"] += 5
+
+    # Look for a font appearing on only one page.
+    if len(page_font_sets) >= 2:
+
+        frequency = {}
+
+        for fonts in page_font_sets:
+
+            for font in fonts:
+
+                frequency[font] = (
+                    frequency.get(font, 0)
+                    + 1
+                )
+
+        rare_fonts = [
+            font
+            for font, count
+            in frequency.items()
+            if count == 1
+        ]
+
+        if rare_fonts:
+
+            result["evidence"].append(
+                "وجدت خطوطًا تظهر في صفحة واحدة فقط."
+            )
+
+            result["score"] += min(
+                8,
+                len(rare_fonts) * 2,
+            )
 
     result["score"] = min(
         100,
@@ -697,14 +644,14 @@ def document_forensics(path):
 
 
 # ============================================================
-# VISUAL PAGE FINGERPRINT
+# VISUAL RENDER
 # ============================================================
 
-def visual_forensics(path):
+def visual_analysis(path):
 
     result = {
         "rendered": 0,
-        "hashes": [],
+        "page_hashes": [],
         "error": None,
     }
 
@@ -719,14 +666,14 @@ def visual_forensics(path):
             MAX_PAGES,
         )
 
-        for index in range(pages):
+        for i in range(pages):
 
-            page = doc[index]
+            page = doc[i]
 
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(
-                    1.2,
-                    1.2,
+                    1.5,
+                    1.5,
                 ),
                 alpha=False,
             )
@@ -736,7 +683,7 @@ def visual_forensics(path):
             ).hexdigest()
 
             result[
-                "hashes"
+                "page_hashes"
             ].append(
                 digest
             )
@@ -760,44 +707,26 @@ def visual_forensics(path):
 
 
 # ============================================================
-# FULL ANALYSIS
+# MAIN FORENSIC ENGINE
 # ============================================================
 
-def analyze_pdf(path):
+def forensic_scan(path):
 
-    logger.info(
-        "🔬 Starting PDF forensic analysis"
-    )
+    raw = analyze_raw(path)
 
-    raw = raw_forensics(path)
-
-    metadata = metadata_forensics(
+    metadata = analyze_metadata(
         path
     )
 
-    document = document_forensics(
+    document = analyze_document(
         path
     )
 
-    visual = visual_forensics(
+    visual = visual_analysis(
         path
     )
 
-    # --------------------------------------------------------
-    # Combined score
-    # --------------------------------------------------------
-
-    score = (
-        raw["score"] * 0.40
-        + metadata["score"] * 0.40
-        + document["score"] * 0.20
-    )
-
-    score = round(
-        min(100, score)
-    )
-
-    warnings = []
+    evidence = []
 
     for source in (
         raw,
@@ -805,15 +734,13 @@ def analyze_pdf(path):
         document,
     ):
 
-        for warning in source[
-            "warnings"
+        for item in source[
+            "evidence"
         ]:
 
-            if warning not in warnings:
+            if item not in evidence:
 
-                warnings.append(
-                    warning
-                )
+                evidence.append(item)
 
     editors = list(
         dict.fromkeys(
@@ -822,21 +749,66 @@ def analyze_pdf(path):
         )
     )
 
+    # --------------------------------------------------------
+    # Weighted score
+    # --------------------------------------------------------
+
+    score = (
+        raw["score"] * 0.45
+        + metadata["score"] * 0.40
+        + document["score"] * 0.15
+    )
+
+    score = round(
+        min(100, score)
+    )
+
+    # Known editor is a particularly strong
+    # "processed by external software" signal.
     if editors:
 
         score = max(
             score,
-            70,
+            80,
+        )
+
+    # --------------------------------------------------------
+    # Classification
+    # --------------------------------------------------------
+
+    if editors:
+
+        status = (
+            "🔴 احتمال كبير للتعديل"
+        )
+
+    elif score >= 65:
+
+        status = (
+            "🔴 مؤشرات قوية على التعديل"
+        )
+
+    elif score >= 35:
+
+        status = (
+            "🟠 احتمال وجود تعديل"
+        )
+
+    else:
+
+        status = (
+            "🟢 لا توجد مؤشرات قوية"
         )
 
     return {
         "score": score,
+        "status": status,
         "editors": editors,
+        "evidence": evidence,
         "raw": raw,
         "metadata": metadata,
         "document": document,
         "visual": visual,
-        "warnings": warnings,
     }
 
 
@@ -849,27 +821,6 @@ def make_report(
     path,
     result,
 ):
-
-    score = result["score"]
-
-    if score >= 70:
-
-        status = (
-            "🔴 تم العثور على مؤشرات قوية "
-            "لإعادة معالجة/تعديل الملف"
-        )
-
-    elif score >= 40:
-
-        status = (
-            "🟠 توجد مؤشرات تستحق الفحص"
-        )
-
-    else:
-
-        status = (
-            "🟢 لم يتم العثور على مؤشرات قوية"
-        )
 
     raw = result["raw"]
     metadata = result["metadata"]
@@ -913,38 +864,16 @@ def make_report(
         "🔎 LEX PDF FORENSIC PRO",
 
         "",
-
-        f"📄 الملف: {filename}",
+        f"📄 {filename}",
         f"📦 الحجم: {size_mb:.2f} MB",
         f"📑 الصفحات: {document['pages']}",
 
         "",
-
-        status,
-        f"📊 Risk Score: {score}/100",
-
-        "",
-        "🧪 PDF FORENSICS",
-
-        f"• %%EOF: {raw['eof']}",
-        f"• startxref: {raw['startxref']}",
-        f"• Objects: {raw['objects']}",
-        f"• Streams: {raw['streams']}",
-
-        f"• Incremental revisions: "
-        f"{'YES' if raw['eof'] > 1 else 'NO'}",
-
-        f"• JavaScript: "
-        f"{'YES' if raw['javascript'] else 'NO'}",
-
-        f"• Embedded files: "
-        f"{'YES' if raw['embedded'] else 'NO'}",
-
-        f"• Digital signature indicator: "
-        f"{'YES' if raw['signatures'] else 'NO'}",
+        result["status"],
+        f"📊 Risk Score: {result['score']}/100",
 
         "",
-        "🛠️ برامج ظهرت في الملف",
+        "🛠️ المصدر / البرامج",
 
     ]
 
@@ -961,13 +890,13 @@ def make_report(
     else:
 
         lines.append(
-            "🟢 لم يتم العثور على محرر معروف"
+            "🟢 لم يتم العثور على بصمة محرر معروف"
         )
 
     lines += [
 
         "",
-        "📝 PDF INFO",
+        "📝 PDF Metadata",
 
         f"• Producer: {producer}",
         f"• Creator: {creator}",
@@ -975,7 +904,28 @@ def make_report(
         f"• ModDate: {modified}",
 
         "",
-        "📄 DOCUMENT",
+        "🔬 Structure",
+
+        f"• Objects: {raw['objects']}",
+        f"• Streams: {raw['streams']}",
+        f"• xref: {raw['xref']}",
+        f"• startxref: {raw['startxref']}",
+        f"• %%EOF: {raw['eof']}",
+
+        f"• Incremental revisions: "
+        f"{'YES' if raw['eof'] > 1 else 'NO'}",
+
+        f"• JavaScript: "
+        f"{'YES' if raw['javascript'] else 'NO'}",
+
+        f"• Embedded files: "
+        f"{'YES' if raw['embedded'] else 'NO'}",
+
+        f"• Signature indicator: "
+        f"{'YES' if raw['signature'] else 'NO'}",
+
+        "",
+        "📄 Content",
 
         f"• Text pages: "
         f"{document['text_pages']}",
@@ -993,44 +943,37 @@ def make_report(
         f"{document['annotations']}",
 
         "",
-        "🖼️ VISUAL",
-
-        f"• Rendered: "
-        f"{visual['rendered']}",
-
+        "⚠️ Evidence",
     ]
 
-    if result["warnings"]:
+    if result["evidence"]:
 
-        lines += [
-            "",
-            "⚠️ المؤشرات المكتشفة:",
-        ]
-
-        for warning in result[
-            "warnings"
-        ][:20]:
+        for evidence in result[
+            "evidence"
+        ][:15]:
 
             lines.append(
-                "• " + warning[:250]
+                "• " + evidence[:240]
             )
+
+    else:
+
+        lines.append(
+            "• لم يتم العثور على مؤشرات قوية."
+        )
 
     lines += [
 
         "",
         "🔐 SHA-256",
-
         sha256(path),
 
         "",
-        "⚠️ ملاحظة مهمة:",
-        "وجود Sejda أو أي محرر PDF يعني أن "
-        "الملف تمت معالجته/إعادة حفظه، "
-        "ولا يعني وحده أن المحتوى مزور.",
-
-        "",
-        "الفحص بدون النسخة الأصلية لا يستطيع "
-        "إثبات أن قيمة أو اسمًا معينًا تم تغييره.",
+        "⚠️ ملاحظة:",
+        "هذا النظام يكشف آثار المعالجة "
+        "والتعديل التقني. بدون النسخة الأصلية "
+        "لا يمكن إثبات أن معلومة معينة "
+        "تم تغييرها بنسبة 100%.",
 
         "",
         "By LEX",
@@ -1050,16 +993,16 @@ async def start(
 
     await update.message.reply_text(
         "🤖 LEX PDF FORENSIC PRO\n\n"
-        "ابعث PDF وأنا نفحص:\n\n"
-        "🔎 PDF structure\n"
-        "🛠️ Sejda / Adobe / Smallpdf وغيرها\n"
-        "📝 Info + XMP metadata\n"
+        "ابعث PDF للتحليل.\n\n"
+        "🔎 أبحث عن آثار Sejda وSmallpdf "
+        "وAdobe وغيرها\n"
+        "📝 PDF Info + XMP\n"
         "🔄 revisions / xref / EOF\n"
-        "📦 PDF objects\n"
+        "📦 objects / streams\n"
         "🔤 fonts\n"
-        "🖼️ images / rendering\n\n"
-        "⚠️ النتيجة مؤشرات تقنية وليست "
-        "إثباتًا قانونيًا للتزوير."
+        "🖼️ rendering\n\n"
+        "⚠️ النتيجة تقنية وليست إثباتًا "
+        "قانونيًا للتزوير."
     )
 
 
@@ -1098,14 +1041,14 @@ async def handle_pdf(
 
         await update.message.reply_text(
             f"❌ الملف كبير.\n"
-            f"الحد الأقصى {MAX_FILE_MB} MB."
+            f"الحد الأقصى: {MAX_FILE_MB} MB."
         )
 
         return
 
     workdir = Path(
         tempfile.mkdtemp(
-            prefix="lex_pdf_"
+            prefix="lex_"
         )
     )
 
@@ -1121,8 +1064,8 @@ async def handle_pdf(
         )
 
         await update.message.reply_text(
-            "🔍 استلمت الملف.\n\n"
-            "جاري الفحص الجنائي للـPDF..."
+            "🔍 استلمت الملف.\n"
+            "جاري التحليل الجنائي..."
         )
 
         tg_file = (
@@ -1132,11 +1075,6 @@ async def handle_pdf(
         await tg_file.download_to_drive(
             custom_path=str(path)
         )
-
-        if not path.exists():
-            raise RuntimeError(
-                "PDF download failed"
-            )
 
         with open(
             path,
@@ -1156,7 +1094,7 @@ async def handle_pdf(
             return
 
         result = await asyncio.to_thread(
-            analyze_pdf,
+            forensic_scan,
             path,
         )
 
@@ -1166,12 +1104,11 @@ async def handle_pdf(
             result,
         )
 
-        # Telegram max message size safety
         if len(report) > 3900:
 
             report = (
                 report[:3800]
-                + "\n\n…"
+                + "\n\n..."
             )
 
         await update.message.reply_text(
@@ -1179,9 +1116,9 @@ async def handle_pdf(
         )
 
         logger.info(
-            "✅ PDF analyzed | %s | score=%s",
-            filename,
+            "Analysis complete | score=%s | editors=%s",
             result["score"],
+            result["editors"],
         )
 
     except Exception as e:
@@ -1194,8 +1131,7 @@ async def handle_pdf(
         try:
 
             await update.message.reply_text(
-                "❌ حدث خطأ أثناء التحليل.\n"
-                "جرب PDF آخر."
+                "❌ حدث خطأ أثناء تحليل الملف."
             )
 
         except Exception:
@@ -1226,11 +1162,8 @@ async def error_handler(
     ):
 
         logger.critical(
-            "🚨 TELEGRAM 409 CONFLICT"
-        )
-
-        logger.critical(
-            "Another instance is using BOT_TOKEN."
+            "🚨 409 CONFLICT: "
+            "another instance is using BOT_TOKEN"
         )
 
         return
@@ -1241,7 +1174,7 @@ async def error_handler(
     ):
 
         logger.warning(
-            "Telegram rate limit: %s sec",
+            "Rate limited: %s",
             error.retry_after,
         )
 
@@ -1269,7 +1202,7 @@ async def error_handler(
 
 
 # ============================================================
-# MAIN
+# RUN
 # ============================================================
 
 def main():
@@ -1279,10 +1212,6 @@ def main():
         raise RuntimeError(
             "BOT_TOKEN missing"
         )
-
-    logger.info(
-        "🚀 LEX PDF FORENSIC PRO"
-    )
 
     app = (
         Application.builder()
@@ -1313,7 +1242,7 @@ def main():
     )
 
     logger.info(
-        "✅ Bot ready"
+        "🚀 LEX PDF FORENSIC PRO READY"
     )
 
     app.run_polling(
