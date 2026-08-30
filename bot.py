@@ -3,6 +3,7 @@ import re
 import hashlib
 import tempfile
 import mimetypes
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -22,7 +23,13 @@ from pypdf import PdfReader
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+# Difference considered suspicious when PDF metadata
+# is BEFORE the transaction date.
+#
+# 5 minutes tolerance is used for clock differences.
+TIME_TOLERANCE_SECONDS = 300
 
 
 # ============================================================
@@ -30,10 +37,13 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 # ============================================================
 
 def calculate_sha256(file_path):
+
     sha256 = hashlib.sha256()
 
     with open(file_path, "rb") as f:
+
         while True:
+
             chunk = f.read(1024 * 1024)
 
             if not chunk:
@@ -45,19 +55,33 @@ def calculate_sha256(file_path):
 
 
 # ============================================================
+# RAW PDF DATA
+# ============================================================
+
+def read_pdf_bytes(file_path):
+
+    with open(file_path, "rb") as f:
+        return f.read()
+
+
+# ============================================================
 # PDF METADATA
 # ============================================================
 
 def get_pdf_metadata(file_path):
+
     metadata = {}
 
     try:
+
         reader = PdfReader(file_path)
 
         if reader.metadata:
+
             for key, value in reader.metadata.items():
 
                 if value is not None:
+
                     metadata[str(key)] = str(value)
 
     except Exception:
@@ -67,21 +91,202 @@ def get_pdf_metadata(file_path):
 
 
 # ============================================================
-# RAW PDF ANALYSIS
+# PDF DATE PARSER
 # ============================================================
 
-def analyze_pdf_structure(file_path):
+def parse_pdf_date(value):
+
+    if not value:
+        return None
+
+    value = str(value).strip()
+
+    # Example:
+    # D:20260809105416+01'00'
+
+    match = re.search(
+        r"D:(\d{4})(\d{2})(\d{2})"
+        r"(\d{2})?(\d{2})?(\d{2})?",
+        value
+    )
+
+    if not match:
+        return None
+
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+
+    hour = int(match.group(4) or 0)
+    minute = int(match.group(5) or 0)
+    second = int(match.group(6) or 0)
+
+    try:
+
+        return datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second
+        )
+
+    except ValueError:
+
+        return None
+
+
+# ============================================================
+# TRANSACTION DATE EXTRACTION
+# ============================================================
+
+def extract_transaction_dates(file_path):
+
+    dates = []
+
+    try:
+
+        reader = PdfReader(file_path)
+
+        text = ""
+
+        for page in reader.pages:
+
+            try:
+                text += "\n" + (page.extract_text() or "")
+            except Exception:
+                pass
+
+        # ----------------------------------------------------
+        # DD.MM.YYYY HH:MM:SS
+        # ----------------------------------------------------
+
+        matches = re.findall(
+            r"(?i)"
+            r"(?:Date\s*(?:de\s*)?(?:transaction|operation)?"
+            r"|Transaction\s*Date"
+            r"|Date\s*of\s*Transaction"
+            r"|Date)"
+            r"\s*[:\-]?\s*"
+            r"(\d{1,2}[./-]\d{1,2}[./-]\d{4}"
+            r"\s+\d{1,2}:\d{2}(?::\d{2})?)",
+            text
+        )
+
+        # ----------------------------------------------------
+        # Generic date fallback
+        # ----------------------------------------------------
+
+        if not matches:
+
+            matches = re.findall(
+                r"\b"
+                r"(\d{1,2}[./-]\d{1,2}[./-]\d{4}"
+                r"\s+\d{1,2}:\d{2}(?::\d{2})?)"
+                r"\b",
+                text
+            )
+
+        for value in matches:
+
+            value = value.strip()
+
+            parsed = None
+
+            for fmt in (
+                "%d.%m.%Y %H:%M:%S",
+                "%d.%m.%Y %H:%M",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+                "%d-%m-%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M",
+            ):
+
+                try:
+
+                    parsed = datetime.strptime(
+                        value,
+                        fmt
+                    )
+
+                    break
+
+                except ValueError:
+                    continue
+
+            if parsed:
+
+                dates.append(
+                    {
+                        "raw": value,
+                        "datetime": parsed
+                    }
+                )
+
+    except Exception:
+        pass
+
+    return dates
+
+
+# ============================================================
+# XMP / RAW DATES
+# ============================================================
+
+def extract_raw_dates(data):
+
+    creation_dates = re.findall(
+        rb"/CreationDate\s*\((.*?)\)",
+        data,
+        re.DOTALL
+    )
+
+    modification_dates = re.findall(
+        rb"/ModDate\s*\((.*?)\)",
+        data,
+        re.DOTALL
+    )
+
+    creation = None
+    modification = None
+
+    if creation_dates:
+
+        creation = creation_dates[-1].decode(
+            "latin-1",
+            errors="ignore"
+        )
+
+    if modification_dates:
+
+        modification = modification_dates[-1].decode(
+            "latin-1",
+            errors="ignore"
+        )
+
+    return {
+        "creation_raw": creation,
+        "modification_raw": modification,
+        "creation_count": len(creation_dates),
+        "modification_count": len(modification_dates),
+    }
+
+
+# ============================================================
+# STRUCTURAL FORENSICS
+# ============================================================
+
+def analyze_structure(data):
 
     findings = []
-
-    with open(file_path, "rb") as f:
-        data = f.read()
 
     # --------------------------------------------------------
     # PDF HEADER
     # --------------------------------------------------------
 
     if not data.startswith(b"%PDF-"):
+
         findings.append(
             "Invalid PDF header"
         )
@@ -90,12 +295,12 @@ def analyze_pdf_structure(file_path):
     # STARTXREF
     # --------------------------------------------------------
 
-    startxref_matches = re.findall(
-        rb"\bstartxref\b",
-        data
+    startxref_count = len(
+        re.findall(
+            rb"\bstartxref\b",
+            data
+        )
     )
-
-    startxref_count = len(startxref_matches)
 
     if startxref_count > 1:
 
@@ -104,15 +309,15 @@ def analyze_pdf_structure(file_path):
         )
 
     # --------------------------------------------------------
-    # /PREV
+    # PREV
     # --------------------------------------------------------
 
-    prev_matches = re.findall(
-        rb"/Prev\b",
-        data
+    prev_count = len(
+        re.findall(
+            rb"/Prev\b",
+            data
+        )
     )
-
-    prev_count = len(prev_matches)
 
     if prev_count > 0:
 
@@ -124,12 +329,12 @@ def analyze_pdf_structure(file_path):
     # EOF
     # --------------------------------------------------------
 
-    eof_matches = re.findall(
-        rb"%%EOF",
-        data
+    eof_count = len(
+        re.findall(
+            rb"%%EOF",
+            data
+        )
     )
-
-    eof_count = len(eof_matches)
 
     if eof_count > 1:
 
@@ -138,71 +343,15 @@ def analyze_pdf_structure(file_path):
         )
 
     # --------------------------------------------------------
-    # CREATION DATE
+    # OBJECTS
     # --------------------------------------------------------
 
-    creation_dates = re.findall(
-        rb"/CreationDate\s*\((.*?)\)",
-        data,
-        re.DOTALL
+    object_count = len(
+        re.findall(
+            rb"(?m)^\d+\s+\d+\s+obj\b",
+            data
+        )
     )
-
-    # --------------------------------------------------------
-    # MODIFICATION DATE
-    # --------------------------------------------------------
-
-    modification_dates = re.findall(
-        rb"/ModDate\s*\((.*?)\)",
-        data,
-        re.DOTALL
-    )
-
-    creation_date = None
-    modification_date = None
-
-    if creation_dates:
-
-        creation_date = creation_dates[-1].decode(
-            "latin-1",
-            errors="ignore"
-        )
-
-    if modification_dates:
-
-        modification_date = modification_dates[-1].decode(
-            "latin-1",
-            errors="ignore"
-        )
-
-    # --------------------------------------------------------
-    # DUPLICATE DATE ENTRIES
-    # --------------------------------------------------------
-
-    if len(creation_dates) > 1:
-
-        findings.append(
-            f"Multiple CreationDate entries detected ({len(creation_dates)})"
-        )
-
-    if len(modification_dates) > 1:
-
-        findings.append(
-            f"Multiple ModDate entries detected ({len(modification_dates)})"
-        )
-
-    # --------------------------------------------------------
-    # CREATION / MODIFICATION DIFFERENCE
-    # --------------------------------------------------------
-
-    if (
-        creation_date
-        and modification_date
-        and creation_date != modification_date
-    ):
-
-        findings.append(
-            "CreationDate and ModDate are different"
-        )
 
     # --------------------------------------------------------
     # PRODUCER
@@ -243,6 +392,16 @@ def analyze_pdf_structure(file_path):
         )
 
     # --------------------------------------------------------
+    # SIGNATURE
+    # --------------------------------------------------------
+
+    has_signature = (
+        b"/ByteRange" in data
+        or
+        b"/FT /Sig" in data
+    )
+
+    # --------------------------------------------------------
     # XMP
     # --------------------------------------------------------
 
@@ -252,100 +411,213 @@ def analyze_pdf_structure(file_path):
         b"<rdf:RDF" in data
     )
 
-    # --------------------------------------------------------
-    # DIGITAL SIGNATURE
-    # --------------------------------------------------------
-
-    has_signature = (
-        b"/ByteRange" in data
-        or
-        b"/FT /Sig" in data
-        or
-        b"/Sig" in data
-    )
-
-    # --------------------------------------------------------
-    # OBJECT COUNT
-    # --------------------------------------------------------
-
-    object_matches = re.findall(
-        rb"\n\d+\s+\d+\s+obj\b",
-        data
-    )
-
-    object_count = len(object_matches)
-
-    # --------------------------------------------------------
-    # RETURN
-    # --------------------------------------------------------
-
     return {
         "findings": findings,
-        "creation_date": creation_date,
-        "modification_date": modification_date,
-        "producer": producer,
-        "creator": creator,
-        "has_xmp": has_xmp,
-        "has_signature": has_signature,
         "startxref_count": startxref_count,
         "prev_count": prev_count,
         "eof_count": eof_count,
         "object_count": object_count,
+        "producer": producer,
+        "creator": creator,
+        "has_signature": has_signature,
+        "has_xmp": has_xmp,
     }
 
 
 # ============================================================
-# FORENSIC ANALYSIS
+# CHRONOLOGY FORENSICS
+# ============================================================
+
+def check_transaction_chronology(
+    file_path,
+    metadata,
+    raw_dates
+):
+
+    findings = []
+
+    transaction_dates = (
+        extract_transaction_dates(
+            file_path
+        )
+    )
+
+    creation = parse_pdf_date(
+        raw_dates["creation_raw"]
+    )
+
+    modification = parse_pdf_date(
+        raw_dates["modification_raw"]
+    )
+
+    # --------------------------------------------------------
+    # TRANSACTION VS CREATION
+    # --------------------------------------------------------
+
+    for tx in transaction_dates:
+
+        tx_date = tx["datetime"]
+
+        if creation:
+
+            difference = (
+                tx_date - creation
+            ).total_seconds()
+
+            # PDF created significantly BEFORE transaction
+            if difference > TIME_TOLERANCE_SECONDS:
+
+                days = difference / 86400
+
+                if days >= 1:
+
+                    findings.append(
+                        "PDF creation date is "
+                        f"{days:.1f} days before transaction date"
+                    )
+
+                else:
+
+                    hours = difference / 3600
+
+                    findings.append(
+                        "PDF creation date is "
+                        f"{hours:.1f} hours before transaction date"
+                    )
+
+        # ----------------------------------------------------
+        # TRANSACTION VS MODIFICATION
+        # ----------------------------------------------------
+
+        if modification:
+
+            difference = (
+                tx_date - modification
+            ).total_seconds()
+
+            if difference > TIME_TOLERANCE_SECONDS:
+
+                days = difference / 86400
+
+                if days >= 1:
+
+                    findings.append(
+                        "PDF modification date is "
+                        f"{days:.1f} days before transaction date"
+                    )
+
+                else:
+
+                    hours = difference / 3600
+
+                    findings.append(
+                        "PDF modification date is "
+                        f"{hours:.1f} hours before transaction date"
+                    )
+
+    return {
+        "findings": findings,
+        "transaction_dates": transaction_dates,
+        "creation": creation,
+        "modification": modification,
+    }
+
+
+# ============================================================
+# MAIN FORENSIC ENGINE
 # ============================================================
 
 def forensic_analysis(file_path):
 
-    structure = analyze_pdf_structure(
+    data = read_pdf_bytes(
         file_path
-    )
-
-    findings = list(
-        structure["findings"]
     )
 
     metadata = get_pdf_metadata(
         file_path
     )
 
-    # --------------------------------------------------------
-    # CHECK METADATA CONSISTENCY
-    # --------------------------------------------------------
-
-    metadata_creation = metadata.get(
-        "/CreationDate"
+    raw_dates = extract_raw_dates(
+        data
     )
 
-    metadata_modification = metadata.get(
-        "/ModDate"
+    structure = analyze_structure(
+        data
     )
 
-    if (
-        metadata_creation
-        and metadata_modification
-        and metadata_creation != metadata_modification
-    ):
+    findings = list(
+        structure["findings"]
+    )
 
-        if (
-            "CreationDate and ModDate are different"
-            not in findings
-        ):
+    # --------------------------------------------------------
+    # DUPLICATE DATE ENTRIES
+    # --------------------------------------------------------
+
+    if raw_dates["creation_count"] > 1:
+
+        findings.append(
+            "Multiple CreationDate entries detected"
+        )
+
+    if raw_dates["modification_count"] > 1:
+
+        findings.append(
+            "Multiple ModDate entries detected"
+        )
+
+    # --------------------------------------------------------
+    # CREATION VS MODIFICATION
+    # --------------------------------------------------------
+
+    creation = parse_pdf_date(
+        raw_dates["creation_raw"]
+    )
+
+    modification = parse_pdf_date(
+        raw_dates["modification_raw"]
+    )
+
+    if creation and modification:
+
+        if creation != modification:
 
             findings.append(
                 "CreationDate and ModDate are different"
             )
 
     # --------------------------------------------------------
-    # RESULT
+    # CHRONOLOGY
     # --------------------------------------------------------
 
-    # IMPORTANT:
-    # ANY FINDING = RED
-    # NO FINDINGS = GREEN
+    chronology = check_transaction_chronology(
+        file_path,
+        metadata,
+        raw_dates
+    )
+
+    findings.extend(
+        chronology["findings"]
+    )
+
+    # --------------------------------------------------------
+    # REMOVE DUPLICATES
+    # --------------------------------------------------------
+
+    unique_findings = []
+
+    for finding in findings:
+
+        if finding not in unique_findings:
+
+            unique_findings.append(
+                finding
+            )
+
+    findings = unique_findings
+
+    # --------------------------------------------------------
+    # FINAL RESULT
+    # --------------------------------------------------------
 
     if findings:
 
@@ -374,11 +646,13 @@ def forensic_analysis(file_path):
         "findings": findings,
         "metadata": metadata,
         "structure": structure,
+        "raw_dates": raw_dates,
+        "chronology": chronology,
     }
 
 
 # ============================================================
-# START COMMAND
+# START
 # ============================================================
 
 async def start(
@@ -407,12 +681,13 @@ async def handle_pdf(
         return
 
     # --------------------------------------------------------
-    # FILE SIZE
+    # SIZE
     # --------------------------------------------------------
 
     if (
         document.file_size
-        and document.file_size > MAX_FILE_SIZE
+        and
+        document.file_size > MAX_FILE_SIZE
     ):
 
         await update.message.reply_text(
@@ -423,7 +698,7 @@ async def handle_pdf(
         return
 
     # --------------------------------------------------------
-    # FILE NAME
+    # NAME
     # --------------------------------------------------------
 
     filename = (
@@ -432,7 +707,9 @@ async def handle_pdf(
         "document.pdf"
     )
 
-    if not filename.lower().endswith(".pdf"):
+    if not filename.lower().endswith(
+        ".pdf"
+    ):
 
         await update.message.reply_text(
             "❌ Please send a PDF file."
@@ -440,7 +717,7 @@ async def handle_pdf(
 
         return
 
-    processing_message = await update.message.reply_text(
+    processing = await update.message.reply_text(
         "🔎 Analyzing PDF..."
     )
 
@@ -466,7 +743,7 @@ async def handle_pdf(
         )
 
         # ----------------------------------------------------
-        # REAL PDF CHECK
+        # PDF HEADER
         # ----------------------------------------------------
 
         with open(
@@ -478,14 +755,14 @@ async def handle_pdf(
 
         if header != b"%PDF-":
 
-            await processing_message.edit_text(
+            await processing.edit_text(
                 "❌ Invalid PDF file."
             )
 
             return
 
         # ----------------------------------------------------
-        # MIME TYPE
+        # MIME
         # ----------------------------------------------------
 
         mime_type, _ = mimetypes.guess_type(
@@ -497,7 +774,7 @@ async def handle_pdf(
             mime_type = "application/pdf"
 
         # ----------------------------------------------------
-        # SHA-256
+        # HASH
         # ----------------------------------------------------
 
         file_hash = calculate_sha256(
@@ -513,14 +790,20 @@ async def handle_pdf(
         )
 
         # ----------------------------------------------------
-        # RESULT MESSAGE
+        # SIZE
         # ----------------------------------------------------
 
         file_size = (
             document.file_size
             or
-            os.path.getsize(temp_path)
+            os.path.getsize(
+                temp_path
+            )
         )
+
+        # ----------------------------------------------------
+        # OUTPUT
+        # ----------------------------------------------------
 
         message = (
             "🔎 LEX PDF FORENSIC PRO\n\n"
@@ -542,20 +825,20 @@ async def handle_pdf(
             "By LEX"
         )
 
-        await processing_message.edit_text(
+        await processing.edit_text(
             message
         )
 
     except Exception as error:
 
         print(
-            "PDF ANALYSIS ERROR:",
+            "FORENSIC ERROR:",
             repr(error)
         )
 
         try:
 
-            await processing_message.edit_text(
+            await processing.edit_text(
                 "❌ Analysis failed.\n\n"
                 f"Error: {str(error)[:500]}"
             )
@@ -564,10 +847,6 @@ async def handle_pdf(
             pass
 
     finally:
-
-        # ----------------------------------------------------
-        # DELETE TEMP FILE
-        # ----------------------------------------------------
 
         if (
             temp_path
@@ -642,10 +921,6 @@ def main():
         drop_pending_updates=True
     )
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
