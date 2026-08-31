@@ -1,692 +1,224 @@
 import os
-import re
-import logging
 import tempfile
-import hashlib
-import zlib
+import logging
 
-import fitz  # PyMuPDF
-
+import fitz
 from telegram import Update
 from telegram.ext import (
     Application,
+    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-
-# ============================================================
+# =========================================================
 # CONFIG
-# ============================================================
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing")
+    raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables")
 
-
-# ============================================================
+# =========================================================
 # LOGGING
-# ============================================================
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | LEX | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 logger = logging.getLogger("LEX")
 
 
-# ============================================================
-# LIMITS
-# ============================================================
+# =========================================================
+# START
+# =========================================================
 
-MAX_FILE_SIZE = 30 * 1024 * 1024
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "LEX PDF Bot خدام\n\n"
+        "أرسل PDF للفحص."
+    )
 
 
-# ============================================================
-# PDF RAW INSPECTOR
-# ============================================================
+# =========================================================
+# PDF ANALYSIS
+# =========================================================
 
-def inspect_raw_pdf(path):
+def analyze_pdf(path):
 
-    result = {
-        "size": 0,
-        "sha256": "",
-        "header": False,
-        "eof": False,
-        "objects": 0,
-        "streams": 0,
-        "endstreams": 0,
-        "xref": 0,
-        "startxref": 0,
-        "trailer": 0,
-        "prev": 0,
-        "objstm": 0,
-        "images": 0,
-        "fonts": 0,
-        "javascript": 0,
-        "openaction": 0,
-        "embedded_files": 0,
-        "annots": 0,
-        "acroform": 0,
-        "metadata": 0,
-        "errors": [],
-    }
+    score = 0
 
     try:
+
+        # -------------------------------------------------
+        # Open PDF
+        # -------------------------------------------------
+
+        doc = fitz.open(path)
+
+        if doc.page_count == 0:
+            return "مشبوه"
+
+        # -------------------------------------------------
+        # Raw bytes
+        # -------------------------------------------------
 
         with open(path, "rb") as f:
             data = f.read()
 
-        result["size"] = len(data)
+        # -------------------------------------------------
+        # Basic PDF validation
+        # -------------------------------------------------
 
-        result["sha256"] = hashlib.sha256(data).hexdigest()
+        if not data.startswith(b"%PDF-"):
+            score += 100
 
-        # ----------------------------------------------------
-        # HEADER
-        # ----------------------------------------------------
+        if b"%%EOF" not in data[-8192:]:
+            score += 40
 
-        result["header"] = data.startswith(b"%PDF-")
+        # -------------------------------------------------
+        # PDF objects
+        # -------------------------------------------------
 
-        # ----------------------------------------------------
-        # EOF
-        # ----------------------------------------------------
+        if b" obj" not in data:
+            score += 30
 
-        result["eof"] = b"%%EOF" in data[-8192:]
+        # -------------------------------------------------
+        # Broken stream structure
+        # -------------------------------------------------
 
-        # ----------------------------------------------------
-        # OBJECTS
-        # ----------------------------------------------------
+        streams = data.count(b"stream")
+        endstreams = data.count(b"endstream")
 
-        result["objects"] = len(
-            re.findall(
-                rb"(?m)^\s*\d+\s+\d+\s+obj\b",
-                data
-            )
-        )
+        if streams != endstreams:
+            score += 35
 
-        # ----------------------------------------------------
-        # STREAMS
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # Broken xref
+        # -------------------------------------------------
 
-        result["streams"] = len(
-            re.findall(
-                rb"(?m)^\s*stream(?:\r\n|\n|\r)",
-                data
-            )
-        )
+        if b"startxref" not in data:
+            score += 25
 
-        result["endstreams"] = len(
-            re.findall(
-                rb"(?m)^\s*endstream\b",
-                data
-            )
-        )
+        # -------------------------------------------------
+        # IMPORTANT:
+        #
+        # ModDate is NOT considered proof of forgery.
+        # Images are NOT considered proof.
+        # Fonts are NOT considered proof.
+        # Streams are NOT considered proof.
+        #
+        # BaridiMob PDFs can legitimately contain them.
+        # -------------------------------------------------
 
-        # ----------------------------------------------------
-        # XREF / TRAILER
-        # ----------------------------------------------------
-
-        result["xref"] = len(
-            re.findall(
-                rb"(?m)^\s*xref\s*$",
-                data
-            )
-        )
-
-        result["startxref"] = len(
-            re.findall(
-                rb"startxref",
-                data
-            )
-        )
-
-        result["trailer"] = len(
-            re.findall(
-                rb"(?m)^\s*trailer\b",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # INCREMENTAL UPDATE
-        # ----------------------------------------------------
-
-        result["prev"] = len(
-            re.findall(
-                rb"/Prev\s+\d+",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # OBJECT STREAMS
-        # ----------------------------------------------------
-
-        result["objstm"] = len(
-            re.findall(
-                rb"/Type\s*/ObjStm",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # IMAGES
-        # ----------------------------------------------------
-
-        result["images"] = len(
-            re.findall(
-                rb"/Subtype\s*/Image",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # FONTS
-        # ----------------------------------------------------
-
-        result["fonts"] = len(
-            re.findall(
-                rb"/Type\s*/Font\b",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # JAVASCRIPT
-        # ----------------------------------------------------
-
-        result["javascript"] = (
-            len(re.findall(rb"/JavaScript\b", data)) +
-            len(re.findall(rb"/JS\b", data))
-        )
-
-        # ----------------------------------------------------
-        # OPEN ACTION
-        # ----------------------------------------------------
-
-        result["openaction"] = len(
-            re.findall(
-                rb"/OpenAction\b",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # EMBEDDED FILES
-        # ----------------------------------------------------
-
-        result["embedded_files"] = len(
-            re.findall(
-                rb"/EmbeddedFile\b",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # ANNOTATIONS
-        # ----------------------------------------------------
-
-        result["annots"] = len(
-            re.findall(
-                rb"/Annot\b",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # ACROFORM
-        # ----------------------------------------------------
-
-        result["acroform"] = len(
-            re.findall(
-                rb"/AcroForm\b",
-                data
-            )
-        )
-
-        # ----------------------------------------------------
-        # METADATA
-        # ----------------------------------------------------
-
-        result["metadata"] = (
-            len(re.findall(rb"/Metadata\b", data))
-            +
-            len(re.findall(rb"/Info\b", data))
-        )
-
-    except Exception as e:
-
-        result["errors"].append(str(e))
-
-    return result
-
-
-# ============================================================
-# PDF DOCUMENT INSPECTION
-# ============================================================
-
-def inspect_document(path):
-
-    result = {
-        "pages": 0,
-        "metadata": {},
-        "fonts": 0,
-        "images": 0,
-        "text_pages": 0,
-        "empty_pages": 0,
-        "page_sizes": [],
-        "links": 0,
-        "annotations": 0,
-        "forms": 0,
-        "encrypted": False,
-        "open_error": False,
-    }
-
-    doc = None
-
-    try:
-
-        doc = fitz.open(path)
-
-        result["pages"] = doc.page_count
-
-        result["encrypted"] = doc.is_encrypted
-
-        result["metadata"] = doc.metadata or {}
-
-        font_set = set()
-        image_count = 0
+        # -------------------------------------------------
+        # Inspect pages
+        # -------------------------------------------------
 
         for page in doc:
 
-            # ------------------------------------------------
-            # PAGE SIZE
-            # ------------------------------------------------
-
-            rect = page.rect
-
-            result["page_sizes"].append(
-                (
-                    round(rect.width, 2),
-                    round(rect.height, 2)
-                )
+            # Make sure page can actually be rendered
+            page.get_pixmap(
+                matrix=fitz.Matrix(0.5, 0.5),
+                alpha=False
             )
 
-            # ------------------------------------------------
-            # TEXT
-            # ------------------------------------------------
+            # Read text
+            page.get_text("text")
 
-            try:
+            # Read images
+            page.get_images(full=True)
 
-                text = page.get_text("text")
+            # Read fonts
+            page.get_fonts(full=True)
 
-                if text and text.strip():
-                    result["text_pages"] += 1
-                else:
-                    result["empty_pages"] += 1
+        # -------------------------------------------------
+        # Metadata
+        # -------------------------------------------------
 
-            except Exception:
-                pass
+        metadata = doc.metadata or {}
 
-            # ------------------------------------------------
-            # IMAGES
-            # ------------------------------------------------
+        # We only inspect it.
+        # We DO NOT automatically mark the PDF fake.
 
-            try:
+        _creation = metadata.get("creationDate")
+        _modified = metadata.get("modDate")
+        _producer = metadata.get("producer")
+        _creator = metadata.get("creator")
 
-                images = page.get_images(full=True)
-
-                image_count += len(images)
-
-            except Exception:
-                pass
-
-            # ------------------------------------------------
-            # FONTS
-            # ------------------------------------------------
-
-            try:
-
-                fonts = page.get_fonts(full=True)
-
-                for font in fonts:
-                    if font:
-                        font_set.add(
-                            tuple(font[:4])
-                        )
-
-            except Exception:
-                pass
-
-            # ------------------------------------------------
-            # LINKS
-            # ------------------------------------------------
-
-            try:
-                result["links"] += len(page.get_links())
-            except Exception:
-                pass
-
-            # ------------------------------------------------
-            # ANNOTATIONS
-            # ------------------------------------------------
-
-            try:
-
-                annotations = page.annots()
-
-                if annotations:
-
-                    for _ in annotations:
-                        result["annotations"] += 1
-
-            except Exception:
-                pass
-
-        result["images"] = image_count
-        result["fonts"] = len(font_set)
-
-        # ----------------------------------------------------
-        # FORMS
-        # ----------------------------------------------------
-
-        try:
-
-            for page in doc:
-
-                widgets = page.widgets()
-
-                if widgets:
-
-                    for _ in widgets:
-                        result["forms"] += 1
-
-        except Exception:
-            pass
-
-    except Exception:
-
-        result["open_error"] = True
-
-    finally:
-
-        if doc:
-
-            try:
-                doc.close()
-            except Exception:
-                pass
-
-    return result
-
-
-# ============================================================
-# STRUCTURAL CONSISTENCY
-# ============================================================
-
-def structural_check(raw, doc):
-
-    suspicious = 0
-
-    # --------------------------------------------------------
-    # Invalid PDF header
-    # --------------------------------------------------------
-
-    if not raw["header"]:
-        suspicious += 100
-
-    # --------------------------------------------------------
-    # Missing EOF
-    # --------------------------------------------------------
-
-    if not raw["eof"]:
-        suspicious += 40
-
-    # --------------------------------------------------------
-    # PDF cannot be opened
-    # --------------------------------------------------------
-
-    if doc["open_error"]:
-        suspicious += 100
-
-    # --------------------------------------------------------
-    # No pages
-    # --------------------------------------------------------
-
-    if doc["pages"] <= 0:
-        suspicious += 50
-
-    # --------------------------------------------------------
-    # Broken stream balance
-    # --------------------------------------------------------
-
-    stream_difference = abs(
-        raw["streams"] -
-        raw["endstreams"]
-    )
-
-    if stream_difference > 0:
-        suspicious += 35
-
-    # --------------------------------------------------------
-    # Object count
-    # --------------------------------------------------------
-
-    if raw["objects"] == 0:
-        suspicious += 50
-
-    # --------------------------------------------------------
-    # startxref
-    # --------------------------------------------------------
-
-    if raw["startxref"] == 0:
-        suspicious += 30
-
-    # --------------------------------------------------------
-    # Page structure
-    # --------------------------------------------------------
-
-    if doc["pages"] > 1:
-
-        sizes = set(
-            doc["page_sizes"]
+        # Prevent unused-variable problems
+        _ = (
+            _creation,
+            _modified,
+            _producer,
+            _creator,
         )
 
-        # Different page sizes are NOT automatically suspicious.
-        # Only a small signal.
-        if len(sizes) > 4:
-            suspicious += 2
+        doc.close()
 
-    # --------------------------------------------------------
-    # Incremental revisions
-    # --------------------------------------------------------
+        # -------------------------------------------------
+        # FINAL RESULT
+        # -------------------------------------------------
 
-    # IMPORTANT:
-    # /Prev is NOT automatically forgery.
-    #
-    # It is a valid PDF feature.
-    #
-    # Therefore only a very small signal is used.
-    # --------------------------------------------------------
+        if score >= 25:
+            return "مشبوه"
 
-    if raw["prev"] >= 3:
-        suspicious += 4
+        return "صحيح"
 
-    # --------------------------------------------------------
-    # JavaScript
-    # --------------------------------------------------------
+    except Exception as e:
 
-    if raw["javascript"] > 0:
-        suspicious += 15
-
-    # --------------------------------------------------------
-    # OpenAction
-    # --------------------------------------------------------
-
-    if raw["openaction"] > 0:
-        suspicious += 8
-
-    # --------------------------------------------------------
-    # Embedded files
-    # --------------------------------------------------------
-
-    if raw["embedded_files"] > 0:
-        suspicious += 5
-
-    return min(
-        suspicious,
-        100
-    )
-
-
-# ============================================================
-# FORENSIC DECISION
-# ============================================================
-
-def analyze_pdf(path):
-
-    raw = inspect_raw_pdf(path)
-
-    doc = inspect_document(path)
-
-    structural_score = structural_check(
-        raw,
-        doc
-    )
-
-    # ========================================================
-    # IMPORTANT
-    # ========================================================
-    #
-    # Metadata such as ModDate is NOT treated as proof.
-    #
-    # BaridiMob PDFs can legitimately contain:
-    # - streams
-    # - images
-    # - fonts
-    # - metadata
-    # - creation/modification information
-    #
-    # Therefore we do NOT mark them suspicious simply because
-    # these fields exist.
-    #
-    # ========================================================
-
-    metadata = doc.get(
-        "metadata",
-        {}
-    )
-
-    producer = str(
-        metadata.get(
-            "producer",
-            ""
+        logger.exception(
+            "PDF analysis failed: %s",
+            e
         )
-    ).lower()
 
-    creator = str(
-        metadata.get(
-            "creator",
-            ""
-        )
-    ).lower()
-
-    # --------------------------------------------------------
-    # Strong corruption indicators
-    # --------------------------------------------------------
-
-    if raw["errors"]:
-        structural_score += 30
-
-    # --------------------------------------------------------
-    # Contradictory raw structure
-    # --------------------------------------------------------
-
-    if (
-        raw["xref"] == 0
-        and raw["objstm"] == 0
-        and raw["startxref"] == 0
-    ):
-        structural_score += 20
-
-    # --------------------------------------------------------
-    # Excessive annotation/form manipulation
-    # --------------------------------------------------------
-
-    if doc["annotations"] > 30:
-        structural_score += 5
-
-    if doc["forms"] > 20:
-        structural_score += 5
-
-    # --------------------------------------------------------
-    # FINAL
-    # --------------------------------------------------------
-
-    structural_score = min(
-        structural_score,
-        100
-    )
-
-    if structural_score >= 25:
-        verdict = "مشبوه"
-    else:
-        verdict = "صحيح"
-
-    return verdict
+        return "مشبوه"
 
 
-# ============================================================
-# TELEGRAM HANDLER
-# ============================================================
+# =========================================================
+# PDF HANDLER
+# =========================================================
 
-async def handle_pdf(
+async def pdf_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     message = update.effective_message
 
-    if not message or not message.document:
+    if not message:
         return
 
     document = message.document
 
-    filename = (
-        document.file_name
-        or "document.pdf"
-    )
-
-    # --------------------------------------------------------
-    # PDF ONLY
-    # --------------------------------------------------------
-
-    if not filename.lower().endswith(".pdf"):
+    if not document:
         return
 
-    # --------------------------------------------------------
-    # SIZE LIMIT
-    # --------------------------------------------------------
+    filename = document.file_name or ""
 
-    if (
-        document.file_size
-        and document.file_size > MAX_FILE_SIZE
-    ):
+    # -----------------------------------------------------
+    # PDF ONLY
+    # -----------------------------------------------------
+
+    if not filename.lower().endswith(".pdf"):
+
         await message.reply_text(
-            "مشبوه\n\nBy LEX"
+            "أرسل PDF فقط."
         )
+
         return
 
     temp_path = None
 
     try:
 
-        # ----------------------------------------------------
-        # TEMP FILE
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # Create temporary file
+        # -------------------------------------------------
 
         with tempfile.NamedTemporaryFile(
             suffix=".pdf",
@@ -695,49 +227,53 @@ async def handle_pdf(
 
             temp_path = tmp.name
 
-        # ----------------------------------------------------
-        # DOWNLOAD
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # Download
+        # -------------------------------------------------
 
-        tg_file = await context.bot.get_file(
+        telegram_file = await context.bot.get_file(
             document.file_id
         )
 
-        await tg_file.download_to_drive(
+        await telegram_file.download_to_drive(
             custom_path=temp_path
         )
 
-        # ----------------------------------------------------
-        # ANALYZE
-        # ----------------------------------------------------
-
-        verdict = analyze_pdf(
-            temp_path
+        logger.info(
+            "PDF received: %s",
+            filename
         )
 
-        # ----------------------------------------------------
-        # ONLY USER OUTPUT
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # Analyze
+        # -------------------------------------------------
+
+        result = analyze_pdf(temp_path)
+
+        # -------------------------------------------------
+        # USER OUTPUT
+        # -------------------------------------------------
 
         await message.reply_text(
-            f"{verdict}\n\nBy LEX"
+            f"{result}\n\nBy LEX"
         )
 
     except Exception as e:
 
         logger.exception(
-            "LEX PDF error: %s",
+            "Telegram PDF error: %s",
             e
         )
 
-        # Fail closed:
-        # if forensic engine cannot safely inspect it,
-        # don't call it authentic.
         await message.reply_text(
             "مشبوه\n\nBy LEX"
         )
 
     finally:
+
+        # -------------------------------------------------
+        # Delete temporary PDF
+        # -------------------------------------------------
 
         if temp_path:
 
@@ -747,54 +283,73 @@ async def handle_pdf(
                 pass
 
 
-# ============================================================
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    logger.exception(
+        "Telegram error:",
+        exc_info=context.error
+    )
+
+
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
 def main():
 
-    app = (
+    print("================================")
+    print("LEX PDF BOT")
+    print("Starting...")
+    print("================================")
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(
-        MessageHandler(
-            filters.Document.PDF,
-            handle_pdf
+    # /start
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
         )
     )
 
-    logger.info(
-        "LEX PDF FORENSIC BOT STARTED"
+    # /hello
+    application.add_handler(
+        CommandHandler(
+            "hello",
+            start
+        )
     )
 
-    app.run_polling(
+    # PDF
+    application.add_handler(
+        MessageHandler(
+            filters.Document.PDF,
+            pdf_handler
+        )
+    )
+
+    # Errors
+    application.add_error_handler(
+        error_handler
+    )
+
+    print("LEX PDF BOT IS RUNNING")
+
+    application.run_polling(
         drop_pending_updates=True
     )
 
 
 if __name__ == "__main__":
-    main()
-
-"requirements.txt":
-
-python-telegram-bot==22.5
-PyMuPDF==1.26.4
-
-هذا الإصدار يتعمد عدم اعتبار "ModDate" أو وجود الصور أو الـfonts أو الـstreams تزويرًا بحد ذاته، لأن PDFCrowd نفسه يعرض هذه العناصر كجزء من بنية الـPDF التي يتم فحصها، وليس كحكم تلقائي بأن الملف مزور.
-
-والبوت للمستخدم النهائي سيُظهر فقط:
-
-صحيح
-
-By LEX
-
-أو:
-
-مشبوه
-
-By LEX
-
-ولا يرسل "Byte size" ولا metadata ولا score ولا أسباب الفحص. 
+    main() 
